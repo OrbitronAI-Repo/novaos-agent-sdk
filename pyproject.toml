@@ -1,0 +1,346 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novaos-agent-sdk"
+version = "2.0.0"
+description = "Python client library for connecting to and communicating with AI Agents that implement the Agent2Agent Protocol (A2A), spec v1.0.1"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "NovaOS Team"},
+]
+keywords = ["a2a", "agent", "agent2agent", "ai", "client", "novaos", "sdk"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# ── A2A dependency decision ─────────────────────────────────────────────────
+#
+# This package's A2A dependency was settled by replacing `acp-sdk>=1.0.0`'s
+# open, unbounded pin with an explicit decision tied to a release confirmed to
+# implement A2A spec v1.0.0.  Both halves of that decision are now settled, and
+# the answer is the same for the server and the client side: **no vendor A2A
+# runtime library.**
+#
+# 1. **The agent side.**  `AgentBuilder`'s A2A handler is NovaOS's own
+#    code over NovaOS's own types (`a2a_types`, `a2a_task`, `a2a_artifact`,
+#    `a2a_jsonrpc`), so there is nothing for a vendor server SDK to do.  That is
+#    the DIP requirement, not an omission: adding one would put a vendor
+#    concrete type back in the SDK's public surface, which was deliberately
+#    removed.
+#
+# 2. **The client side.**  This entry used to say that a vendor A2A *client*
+#    should use `a2a-sdk>=1.1,<2`.  That option was weighed and not taken: with
+#    the wire model and the JSON-RPC envelope already in
+#    this package — and verified against the real `a2a-sdk` by
+#    `tests/test_a2a_v1_conformance.py` — what the vendor client would have
+#    added over `_a2a.py` is an HTTP POST and an SSE reader, at the cost of a
+#    protobuf-type conversion layer at every call boundary.  The reasoning is
+#    recorded in full in `src/novaos_client_sdk/_a2a.py`'s module docstring.
+#
+# 3. **`acp-sdk` is gone.**  Its one remaining import was `client.py`'s
+#    `run_sync`/`run_stream` transport via `_acp.py`; both were deleted,
+#    so the dependency went with them.  `i-am-bee/acp` has been
+#    archived read-only since 2025-08-25, so nothing was left to track.
+#
+# `a2a-sdk` remains a **test** dependency (the `dev` extra), where it is a
+# conformance peer that checks NovaOS's wire format rather than hiding it —
+# which is what months of emitting v0.3 JSON while claiming v1.0 cost, before
+# this conformance suite existed.
+#
+# 4. **The gRPC binding is a narrow, deliberate exception.**
+#    JSON-RPC and HTTP+JSON are both plain JSON, so reason #2 above holds for
+#    them without qualification: nothing about those bindings requires a
+#    vendor conversion layer. gRPC is different — its wire format literally
+#    *is* protobuf, so calling a gRPC-only peer requires compiled message and
+#    stub classes from *some* `.proto`; there is no JSON-shaped escape hatch.
+#    Rather than vendor and independently regenerate the identical schema
+#    `a2a-sdk` already publishes and versions, the optional `grpc` extra below
+#    depends on bare `a2a-sdk` for its pre-generated `a2a.types.a2a_pb2` /
+#    `a2a_pb2_grpc` modules only — never `a2a.client.*` (its `ClientTransport`,
+#    `ClientFactory` or `Client`). `GrpcTransport`'s method dispatch, header
+#    negotiation, SSRF integration and error mapping are NovaOS's own code,
+#    exactly as reason #2 requires for the other two bindings; see
+#    `src/novaos_client_sdk/_a2a_grpc.py`'s module docstring.
+dependencies = [
+    "httpx>=0.24.0",
+]
+
+[project.optional-dependencies]
+crypto = [
+    "PyJWT[crypto]>=2.8.0",
+    # Sealed-envelope secret delivery. Already pulled in by
+    # PyJWT's own crypto extra, but named here because
+    # `a2a_sealed_envelope`/`a2a_pod_keyring` depend on it directly and must not
+    # break if PyJWT ever changes what its extra installs.
+    "cryptography>=42.0.0",
+    # Agent Card JWS signature verification. RFC 8785 JSON
+    # Canonicalization Scheme — `a2a_card_signing` canonicalizes a card before
+    # hashing it, and a hand-rolled canonicalizer is exactly the kind of thing
+    # that silently drifts from the reference implementation it must
+    # byte-for-byte match. Not itself a crypto library, but it only has a
+    # reason to be installed alongside one, so it rides the same extra rather
+    # than opening a second optional-dependency path.
+    "rfc8785>=0.1.4,<1",
+]
+llm = [
+    "openai>=1.0.0",
+]
+evaluation = [
+    "langfuse>=2.0.0,<3",
+    "openai>=1.0.0",
+]
+otel = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
+schema = [
+    "jsonschema>=4.18.0",
+]
+migrate = [
+    # `migrate transform` is the only user of libcst — a
+    # lossless concrete-syntax-tree rewriter, not `ast`, because
+    # `migrate analyze` only ever reads an agent tree, while `transform` has
+    # to rewrite it in place and preserve every comment and formatting choice
+    # in the rest of the file it does not touch. Narrow extra rather than
+    # folded into `dev`/`all` outright: nothing else in this SDK needs a CST
+    # library, and pulling it into every install would be exactly the kind of
+    # unscoped dependency growth the `dependencies` comment above argues
+    # against — `dev` self-references this extra below instead of restating
+    # the pin, matching the `grpc`/`otel` precedent.
+    "libcst>=1.4.0,<2",
+]
+grpc = [
+    # Bare `a2a-sdk`, not `a2a-sdk[grpc]`: the compiled `a2a.types.a2a_pb2` /
+    # `a2a_pb2_grpc` modules this extra actually needs are always importable
+    # once `a2a-sdk` (and its core `protobuf` dependency) is installed — they
+    # are not gated behind its own `[grpc]` sub-extra, which additionally
+    # pulls in `grpcio-tools`/`grpcio-reflection`. Those are codegen/reflection
+    # tooling this SDK has no use for as a client; see the ADR paragraph above
+    # `dependencies` for why this extra takes only the compiled schema and
+    # nothing else from `a2a-sdk`.
+    "a2a-sdk>=1.1,<2",
+    "grpcio>=1.60",
+    "grpcio-status>=1.60",
+]
+all = [
+    "PyJWT[crypto]>=2.8.0",
+    "cryptography>=42.0.0",
+    "rfc8785>=0.1.4,<1",
+    "openai>=1.0.0",
+    "langfuse>=2.0.0,<3",
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+    "jsonschema>=4.18.0",
+    "libcst>=1.4.0,<2",
+    "a2a-sdk>=1.1,<2",
+    "grpcio>=1.60",
+    "grpcio-status>=1.60",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.8.0,<1.0",
+    "black>=26.3.1,<27.0",
+    "mypy>=1.8.0,<2.0",
+    "pre-commit>=3.0.0",
+    "PyJWT[crypto]>=2.8.0",
+    "cryptography>=42.0.0",
+    "rfc8785>=0.1.4,<1",
+    "respx>=0.21.0",
+    "jsonschema>=4.18.0",
+    # Conformance peer for tests/test_a2a_v1_conformance.py. Not a runtime
+    # dependency — the SDK deliberately owns its own A2A types (DIP) — but the
+    # wire mapping has to be checked against a real v1.0 implementation, since
+    # hand-reading proto3 JSON spellings is exactly what let a wire-format
+    # mismatch through undetected before this conformance suite existed.
+    #
+    # The `http-server` extra pulls starlette/sse-starlette so the suite can
+    # stand up an actual vendor-SDK pod, not just borrow its codecs: the
+    # parity tests drive a real one over HTTP alongside AgentBuilder, because
+    # "these two pods answer the same" is only worth asserting against the
+    # server a scaffolded agent really deploys. The `grpc` sub-extra
+    # (grpcio-tools/grpcio-reflection, dev-only — see the `grpc` extra above
+    # for why the SDK's own runtime dependency stays narrower) lets the same
+    # conformance suite stand up a real gRPC peer for `GrpcTransport`.
+    #
+    # Spec 1.0.0 -> 1.0.1 bump: checked whether this lower bound needed
+    # to move and it does not. The 1.0.1 proto delta is comments-only (see
+    # `a2a_types`'s module docstring), so a2a-sdk's generated code is
+    # byte-for-byte identical whether it was built against 1.0.0 or 1.0.1.
+    # The environment this was verified in has a2a-sdk 1.1.2 installed.
+    #
+    # Upper bound is `<1.2`, not `<2`: this group has no lock file in CI
+    # (`pip install --group dev`, not `uv sync`), so it re-resolves on every
+    # run, and a2a-sdk 1.2.0 changed the *vendor reference server's* own
+    # error-priority ordering for a malformed `SendMessage` sent without an
+    # `A2A-Version` header (invalid-params no longer outranks version
+    # mismatch), which broke `TestOrderingParity`'s vendor-vs-`AgentBuilder`
+    # parity assertion — not a bug in this SDK, but a moving target this
+    # group's un-pinned range let through silently. Revisit the ordering
+    # this SDK mirrors deliberately before widening this again.
+    "a2a-sdk[http-server,grpc]>=1.1,<1.2",
+    # A real ASGI server for `tests/test_agent_builder_interrupted_stream.py`.
+    # The `http-server` extra above brings Starlette, which is
+    # enough to *build* a `StreamingResponse` around `AgentBuilder`'s SSE
+    # generator, but not to observe what an incomplete one does on the wire:
+    # "ASGI callable returned without completing response" is uvicorn's own
+    # log line, and the client-side `RemoteProtocolError` needs a real
+    # chunked body on a real socket. `httpx.ASGITransport` shows neither,
+    # which is exactly how the bug this test guards against stayed invisible
+    # to the rest of this suite.
+    "uvicorn>=0.30",
+    # `tests/fixtures/migrate/verify_target/server.py` is a real,
+    # importable ASGI app served under `tests/test_migrate_verify.py`'s own
+    # `uvicorn` instance — unlike the AST-only `tests/fixtures/migrate/shape_*`
+    # trees `analyze`/`transform` never execute, `verify` actually calls this
+    # one over the wire, so its `from fastapi import FastAPI` has to resolve.
+    # FastAPI (not bare Starlette) because `app.post(A2A_JSONRPC_PATH)(agent
+    # .asgi_endpoint())` is the literal line the `migrate transform` codemod
+    # produces (`transform.py`'s `route_line` action) — the fixture is only a
+    # faithful stand-in for a migrated `server.py` if it uses the same
+    # framework.
+    "fastapi>=0.100",
+    # `grpcio-status` specifically — not covered by the line above. This
+    # extra's `grpcio`/`a2a-sdk[grpc]` are what let the gRPC conformance tests
+    # stand up a real `grpc.aio` server and drive a real channel at it; that
+    # much was enough to pass locally with the `grpc` extra *also* installed,
+    # which is not what CI does (`pip install -e ".[dev]"` only) — CI caught
+    # what a `.[dev,grpc]` local install couldn't have: without
+    # `grpcio-status`, `_a2a_grpc.py`'s `ErrorInfo` unpack silently degrades to
+    # "no structured reason found" and a structured domain error (a task not
+    # found, a task that cannot be canceled) escapes as a bare
+    # `grpc.aio.AioRpcError` instead of the mapped `TaskNotFoundError` /
+    # `TaskNotCancelableError` the conformance tests assert on. Self-
+    # referencing the `grpc` extra rather than restating its three packages,
+    # matching the `otel` line below, so the two cannot drift.
+    "novaos-agent-sdk[grpc]",
+    # `migrate transform`'s tests need libcst installed; self-
+    # referencing the `migrate` extra rather than restating its pin, matching
+    # the `grpc`/`otel` lines here so the two cannot drift.
+    "novaos-agent-sdk[migrate]",
+    # OpenTelemetry, needed by the *tests* rather than by the SDK's runtime —
+    # `tracing.py` and `agent_builder.py` both import it behind an `_HAS_OTEL`
+    # guard, and `tests/test_knowledge_tool_resilience.py` imports `StatusCode`
+    # directly to assert a span is marked ERROR (a regression test for a
+    # previously found tracing defect).
+    #
+    # It used to arrive by accident: `acp-sdk` depended on it, so every install
+    # got it transitively and the whole otel-enabled half of the tracing suite
+    # ran without anyone declaring why. Removing `acp-sdk` made the
+    # accident visible as a CI failure. Declared here so the same tests keep
+    # running — the alternative, an `importorskip`, would silently stop
+    # exercising the otel branch in CI. Self-referencing the `otel` extra rather
+    # than restating its three packages, so the two cannot drift.
+    "novaos-agent-sdk[otel]",
+]
+
+[project.urls]
+Homepage = "https://github.com/OrbitronAI-Repo/novaos-agent-sdk"
+Documentation = "https://orbitronai-repo.github.io/novaos-agent-sdk/"
+Repository = "https://github.com/OrbitronAI-Repo/novaos-agent-sdk"
+Changelog = "https://orbitronai-repo.github.io/novaos-agent-sdk/changelog/"
+Issues = "https://github.com/OrbitronAI-Repo/novaos-agent-sdk/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+# Ruff configuration
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by black)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports
+"**/messages.py" = ["E402"]  # late imports to avoid circular imports
+
+# Black configuration
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+include = '\.pyi?$'
+
+# MyPy configuration
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+    "langfuse.*",
+    "jsonschema.*",
+    "referencing.*",
+    # Optional 'grpc' extra: `a2a-sdk` ships `.pyi` stubs for its
+    # generated `a2a_pb2`/`a2a_pb2_grpc` modules but no `py.typed` marker, and
+    # `grpc`/`grpc_status`/`google.rpc` ship no inline types either.
+    "a2a.*",
+    "grpc.*",
+    "grpc_status.*",
+    "google.rpc.*",
+    "google.protobuf.*",
+]
+ignore_missing_imports = true
+
+# Pytest configuration
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--cov=src/novaos_client_sdk",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "slow: Slow running tests",
+]

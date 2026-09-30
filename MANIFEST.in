@@ -1,0 +1,31 @@
+# Include necessary files
+include README.md
+include CHANGELOG.md
+exclude CHANGELOG-0.x.md
+include LICENSE
+include pyproject.toml
+
+# Include py.typed marker for type checking
+recursive-include src/novaos_client_sdk *.typed
+
+# Include all Python source files
+recursive-include src *.py
+
+# Exclude unnecessary files
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.egg-info
+recursive-exclude tests *
+recursive-exclude examples *
+recursive-exclude docs *
+recursive-exclude scripts *
+recursive-exclude htmlcov *
+recursive-exclude .git *
+recursive-exclude .github *
+global-exclude *.coverage
+global-exclude coverage.xml
+global-exclude .pytest_cache
+global-exclude .ruff_cache
+global-exclude .mypy_cache

@@ -1,0 +1,72 @@
+site_name: NovaOS Agent SDK (Python)
+site_description: Python SDK for building agents on the NovaOS platform
+site_url: https://orbitronai-repo.github.io/novaos-agent-sdk/
+repo_url: https://github.com/OrbitronAI-Repo/novaos-agent-sdk
+repo_name: OrbitronAI-Repo/novaos-agent-sdk
+
+docs_dir: docs/public
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: false
+            show_root_heading: true
+            show_symbol_type_heading: true
+            docstring_style: google
+            filters: ["!^_"]
+            merge_init_into_class: true
+            show_signature_annotations: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+  - attr_list
+
+nav:
+  - Getting started:
+      - Overview: index.md
+      - Install and first call: getting-started.md
+  - Concepts:
+      - A2A primer: concepts/a2a-primer.md
+  - Guides:
+      - Authentication: guides/authentication.md
+      - Invoking agents: guides/invoking-agents.md
+      - Building an agent: guides/building-an-agent.md
+      - Platform tools: guides/platform-tools.md
+      - Agent memory: guides/memory.md
+      - Error handling: guides/error-handling.md
+      - Migrating from 1.x: guides/migrating-from-1x.md
+  - Reference:
+      - API reference: reference/api.md
+      - migrate CLI: reference/migrate-cli.md
+      - Versioning and support: versioning-and-support.md
+      - Security: security.md
+      - Changelog: changelog.md
+      - License: license.md
+
+strict: true

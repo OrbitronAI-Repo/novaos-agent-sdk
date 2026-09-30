@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # job-level permissions replace the workflow default; checkout needs read on a private repo
+      id-token: write  # required for PyPI trusted publishing (PEP 740)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build source distribution and wheel
+        run: python -m build
+
+      - name: Check distribution
+        run: twine check --strict dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        with:
+          packages-dir: dist/
+          print-hash: true
+          attestations: true
+          repository-url: ${{ vars.PYPI_REPOSITORY_URL || 'https://upload.pypi.org/legacy/' }}
+
+  post-publish-smoke:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the published version from PyPI
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python -m venv v
+          # TestPyPI mode: fetch only our own wheel from TestPyPI (--no-deps), then
+          # install that local file so every dependency resolves from PyPI. Mixing
+          # the two indexes lets pip pick a stranger's broken upload of a dependency
+          # from TestPyPI (seen with fastapi during the 1.0.0rc2 rehearsal).
+          install_once() {
+            if [[ "${{ vars.PYPI_REPOSITORY_URL }}" == *test.pypi.org* ]]; then
+              rm -rf dl && mkdir dl
+              v/bin/pip download --no-cache-dir --no-deps --only-binary=:all: \
+                --index-url https://test.pypi.org/simple/ -d dl "novaos-agent-sdk==${VERSION}" \
+              && v/bin/pip install --no-cache-dir dl/*.whl
+            else
+              v/bin/pip install --no-cache-dir "novaos-agent-sdk==${VERSION}"
+            fi
+          }
+          for i in $(seq 1 10); do
+            if install_once; then
+              break
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "error: novaos-agent-sdk==${VERSION} did not become installable" >&2
+              exit 1
+            fi
+            echo "novaos-agent-sdk==${VERSION} not yet available, retrying in 30s ($i/10)..."
+            sleep 30
+          done
+
+      - name: Verify the installed package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          v/bin/python -c "
+          import novaos_client_sdk as s
+          assert s.__version__ == '${VERSION}', s.__version__
+          print('ok', s.__version__)
+          "
