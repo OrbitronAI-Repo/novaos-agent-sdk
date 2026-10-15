@@ -55,6 +55,7 @@ from typing import Any, Final
 from urllib.parse import urljoin
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._ssrf import checked_async_transport
 from novaos_client_sdk.a2a_agent_card import (
     AGENT_CARD_WELL_KNOWN_PATH,
     PROTOCOL_BINDING_JSONRPC,
@@ -115,8 +116,24 @@ class AgentDiscoveryService:
             card = await discovery.agent_card()
             print(card.name, card.skill_ids)
 
-            async with await discovery.to_client() as client:
+            async with await discovery.to_client(
+                allowed_host_suffixes=[".gateway.example"]
+            ) as client:
                 task = await client.send_message("hello", skill_id=card.skill_ids[0])
+        ```
+
+    Third-party partner agents:
+        A partner's Agent Card is attacker-influenceable input: the interface
+        URL it advertises is where the client will dial, and any credentials
+        configured on the client travel with the request. Always pass
+        ``allowed_host_suffixes`` naming the partner's own domain (``to_client``
+        refuses to run without one), so the card
+        cannot redirect the client elsewhere. The private/loopback/link-local
+        IP block is applied on top of the allowlist, never instead of it, and
+        hostnames are checked in the same IDNA form the transport connects to.
+
+        ```python
+        client = await discovery.to_client(allowed_host_suffixes=[".partner.example"])
         ```
     """
 
@@ -130,6 +147,8 @@ class AgentDiscoveryService:
         verify_signatures: bool = False,
         jwks_url: str | None = None,
         signature_algorithms: Sequence[str] | None = None,
+        guard_connect_ips: bool = False,
+        allow_private_ips: bool = False,
     ) -> None:
         """Initialize the discovery service.
 
@@ -157,6 +176,16 @@ class AgentDiscoveryService:
             signature_algorithms: Acceptable JWS algorithms.  See
                 :data:`novaos_client_sdk.a2a_card_signing.DEFAULT_SIGNATURE_ALGORITHMS`
                 for the default.
+            guard_connect_ips: Resolve ``base_url``'s host at connect time,
+                refuse a private/loopback/link-local/reserved address, and
+                connect to the address that was checked, for the card fetch
+                itself. **Opt-in and ``False`` by default** so a local
+                ``http://localhost:8000`` agent keeps working. Turn it on
+                whenever ``base_url`` comes from a user or another untrusted
+                source, since the request carries the ``auth`` headers.
+            allow_private_ips: With ``guard_connect_ips``, skip the range check
+                (e.g. a gateway that legitimately lives on a private network).
+                Ignored otherwise.
 
         Raises:
             NovaOSValidationError: If ``verify_signatures`` is ``True`` and no
@@ -175,6 +204,8 @@ class AgentDiscoveryService:
         self._verify_signatures = verify_signatures
         self._jwks_url = jwks_url
         self._signature_algorithms = signature_algorithms
+        self._guard_connect_ips = guard_connect_ips
+        self._allow_private_ips = allow_private_ips
         self._cache: AgentCard | None = None
         self._cache_timestamp: float | None = None
         self._client: httpx.AsyncClient | None = None
@@ -187,10 +218,17 @@ class AgentDiscoveryService:
             if auth_headers:
                 headers.update(auth_headers)
 
+        guard: dict[str, Any] = (
+            {"transport": checked_async_transport(allow_private_ips=self._allow_private_ips)}
+            if self._guard_connect_ips
+            else {}
+        )
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=self._timeout,
             headers=headers,
+            follow_redirects=False,
+            **guard,
         )
         return self
 
@@ -429,9 +467,16 @@ class AgentDiscoveryService:
         applies to a DNS record's URL, for the same reason — applied here to
         whichever interface was selected, regardless of binding.
 
+        **A host allowlist is required.**  The card's URL decides where the
+        client dials, and the client's ``headers``/``auth`` are sent to it, so
+        a card must not be able to redirect them to a host the caller never
+        named.  ``allowed_host_suffixes`` is therefore mandatory, with no
+        opt-out; the private/loopback/link-local IP block applies on top of it.
+
         Args:
-            allowed_host_suffixes: Optional hostname suffix allowlist.  Pass the
-                deployment's own domains to refuse a card that points elsewhere.
+            allowed_host_suffixes: Hostname suffix allowlist naming the
+                domains the card's URL may point at (``[".partner.example"]``).
+                Required: an empty or missing list raises.
             config: Per-client defaults, including which bindings this caller
                 can speak and whose preference order wins — see above.  Also
                 forwarded to the constructed :class:`~novaos_client_sdk.client.Client`
@@ -446,8 +491,14 @@ class AgentDiscoveryService:
         Raises:
             NovaOSValidationError: If the card advertises no interface this
                 client can speak.
-            NovaOSError: If the advertised URL fails the SSRF guard.
+            NovaOSError: If no allowlist was given, or if the advertised URL
+                fails the allowlist or the SSRF guard.
         """
+        if not any(allowed_host_suffixes or []):
+            raise NovaOSError(
+                "AgentDiscoveryService.to_client requires allowed_host_suffixes naming the "
+                "domains the Agent Card may point at"
+            )
         card = await self.agent_card()
         cfg = config if config is not None else ClientConfig()
         supported_bindings = cfg.supported_protocol_bindings or [PROTOCOL_BINDING_JSONRPC]
@@ -474,6 +525,7 @@ class AgentDiscoveryService:
         validate_agent_url(selected.url, allowed_host_suffixes)
         return Client(
             base_url=selected.url,
+            guard_connect_ips=True,
             card=card,
             protocol_binding=selected.protocol_binding,
             config=config,

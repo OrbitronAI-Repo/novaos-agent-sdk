@@ -193,14 +193,26 @@ def validate_host_allowed(url: str, allowed_hosts: list[str] | None = None) -> N
     """
     from urllib.parse import urlparse
 
+    from novaos_client_sdk._idna import wire_hostname, wire_suffix
+    from novaos_client_sdk.exceptions import NovaOSError
+
     if allowed_hosts is None:
         allowed_hosts = get_allowed_hosts_from_env()
     if not allowed_hosts:
         return
 
+    # Compared in the IDNA form the HTTP client connects to, so a Unicode host
+    # or allowlist entry matches its punycode twin and a look-alike cannot slip
+    # past a plain string comparison.
     hostname = urlparse(url).hostname
-    if not hostname or not any(
-        hostname == suffix or hostname.endswith(f".{suffix}") for suffix in allowed_hosts
+    try:
+        wire_host = wire_hostname(hostname) if hostname else None
+        wire_allowed = [wire_suffix(h) for h in allowed_hosts if h]
+    except NovaOSError as exc:
+        raise ValueError(f"Host '{hostname}' for URL '{url}' cannot be checked: {exc}") from exc
+    if not wire_host or not any(
+        wire_host == suffix.lstrip(".") or wire_host.endswith(f".{suffix.lstrip('.')}")
+        for suffix in wire_allowed
     ):
         raise ValueError(
             f"Host '{hostname}' for URL '{url}' is not in the configured allowlist "

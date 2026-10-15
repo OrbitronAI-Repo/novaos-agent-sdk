@@ -46,6 +46,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from typing import Any, Final
 
+from novaos_client_sdk._idna import wire_hostname
+from novaos_client_sdk._ssrf import resolve_checked
 from novaos_client_sdk._transport import (
     A2A_REASON_TO_JSONRPC_CODE,
     ClientTransport,
@@ -134,6 +136,17 @@ def _route(method: str) -> tuple[str, type[ProtoMessage], bool]:
         raise NovaOSError(f"GrpcTransport has no route for A2A method {method!r}.") from None
 
 
+def _split_host_port(target: str) -> tuple[str, str]:
+    """Split ``host[:port]`` (``[v6]:port`` too) into ``(host, port)``; port may be ``""``."""
+    if target.startswith("["):
+        host, _, rest = target[1:].partition("]")
+        return host, rest.lstrip(":")
+    host, sep, port = target.rpartition(":")
+    if sep and port.isdigit():
+        return host, port
+    return target, ""
+
+
 def _parse_target(base_url: str) -> tuple[str, bool]:
     """Split a gRPC interface URL into ``(target, is_secure)``.
 
@@ -145,9 +158,25 @@ def _parse_target(base_url: str) -> tuple[str, bool]:
     internal/dev gRPC usage.
     """
     if "://" not in base_url:
-        return base_url.rstrip("/"), False
+        return _wire_authority(base_url.rstrip("/")), False
     scheme, _, rest = base_url.partition("://")
-    return rest.rstrip("/"), scheme in ("https", "grpcs")
+    return _wire_authority(rest.rstrip("/")), scheme in ("https", "grpcs")
+
+
+def _wire_authority(authority: str) -> str:
+    """Rewrite the host of a ``host[:port]`` target into its IDNA wire form.
+
+    gRPC's resolver does not encode a Unicode host itself, so it would never
+    look up the name that :func:`~novaos_client_sdk.dns.validate_agent_url`
+    checked. Handing it the same ASCII form keeps the validated and the dialled
+    host identical.
+    """
+    if authority.startswith("["):  # bracketed IPv6 literal
+        return authority
+    host, sep, port = authority.rpartition(":")
+    if not sep or not port.isdigit():
+        host, sep, port = authority, "", ""
+    return wire_hostname(host) + sep + port
 
 
 def _error_info_from_status(
@@ -212,6 +241,8 @@ class GrpcTransport(ClientTransport):
         timeout: float | None = None,
         headers: dict[str, str] | None = None,
         channel_factory: GrpcChannelFactory | None = None,
+        guard_connect_ips: bool = False,
+        allow_private_ips: bool = False,
     ) -> None:
         """Initialize the transport.
 
@@ -226,11 +257,19 @@ class GrpcTransport(ClientTransport):
             channel_factory: Builds the channel for a given target, for
                 custom credentials/interceptors/options. Defaults to a
                 secure or insecure channel based on the target's scheme.
+            guard_connect_ips: Resolve the host when the channel opens, refuse
+                a private/loopback/link-local/reserved address, and dial that
+                checked address, keeping the original host as the TLS server
+                name and authority. Not applied when ``channel_factory`` builds
+                the channel — the SDK cannot pin a channel it does not create.
+            allow_private_ips: With ``guard_connect_ips``, skip the range check.
         """
         self._target, self._secure = _parse_target(base_url)
         self._timeout = timeout
         self._base_headers = {A2A_VERSION_HEADER: A2A_PROTOCOL_VERSION, **(headers or {})}
         self._channel_factory = channel_factory
+        self._guard_connect_ips = guard_connect_ips
+        self._allow_private_ips = allow_private_ips
         self._channel: grpc.aio.Channel | None = None
         self._stub: a2a_pb2_grpc.A2AServiceStub | None = None
 
@@ -238,12 +277,39 @@ class GrpcTransport(ClientTransport):
         """Open the underlying gRPC channel."""
         if self._channel_factory is not None:
             self._channel = self._channel_factory(self._target)
-        elif self._secure:
-            self._channel = grpc.aio.secure_channel(self._target, grpc.ssl_channel_credentials())
         else:
-            self._channel = grpc.aio.insecure_channel(self._target)
+            target, options = await self._pinned_target()
+            if self._secure:
+                self._channel = grpc.aio.secure_channel(
+                    target, grpc.ssl_channel_credentials(), options=options
+                )
+            else:
+                self._channel = grpc.aio.insecure_channel(target, options=options)
         self._stub = a2a_pb2_grpc.A2AServiceStub(self._channel)
         return self
+
+    async def _pinned_target(self) -> tuple[str, list[tuple[str, str]] | None]:
+        """The channel target, pinned to a range-checked address when guarded.
+
+        The original host stays as the TLS server name and the HTTP/2
+        authority, so certificate verification still checks the name the
+        caller asked for, not the address.
+        """
+        if not self._guard_connect_ips:
+            return self._target, None
+        host, port = _split_host_port(self._target)
+        address = await resolve_checked(
+            host,
+            int(port) if port else (443 if self._secure else 80),
+            allow_private_ips=self._allow_private_ips,
+        )
+        pinned = f"[{address}]" if ":" in address else address
+        if port:
+            pinned = f"{pinned}:{port}"
+        options = [("grpc.default_authority", self._target)]
+        if self._secure:
+            options.append(("grpc.ssl_target_name_override", host))
+        return pinned, options
 
     async def close(self) -> None:
         """Close the underlying gRPC channel."""

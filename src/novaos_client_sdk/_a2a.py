@@ -42,6 +42,7 @@ from typing import Any, Final
 from uuid import uuid4
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._ssrf import checked_async_transport
 from novaos_client_sdk._transport import ClientTransport, raise_for_jsonrpc_error
 from novaos_client_sdk.a2a_jsonrpc import (
     parse_response,
@@ -212,6 +213,8 @@ class A2ATransport(ClientTransport):
         *,
         timeout: float | None = None,
         headers: dict[str, str] | None = None,
+        guard_connect_ips: bool = False,
+        allow_private_ips: bool = False,
     ) -> None:
         """Initialize the transport.
 
@@ -241,14 +244,23 @@ class A2ATransport(ClientTransport):
             A2A_VERSION_HEADER: A2A_PROTOCOL_VERSION,
             **(headers or {}),
         }
+        self._guard_connect_ips = guard_connect_ips
+        self._allow_private_ips = allow_private_ips
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> A2ATransport:
         """Open the underlying HTTP client."""
+        guard: dict[str, Any] = (
+            {"transport": checked_async_transport(allow_private_ips=self._allow_private_ips)}
+            if self._guard_connect_ips
+            else {}
+        )
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=self._timeout,
             headers=self._headers,
+            follow_redirects=False,
+            **guard,
         )
         return self
 

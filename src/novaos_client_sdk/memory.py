@@ -97,9 +97,10 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_details, status_error_message
 from novaos_client_sdk._resilience import CircuitBreaker as _CircuitBreaker
 from novaos_client_sdk._resilience import backoff_delay
 from novaos_client_sdk.exceptions import (
@@ -145,6 +146,39 @@ def _next_write_ordinal(ctx: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
+MemoryType = Literal["semantic", "episodic", "procedural"]
+"""Optional kind of a memory. Opt-in on write and on query/assemble filters."""
+
+MEMORY_TYPES: tuple[str, ...] = ("semantic", "episodic", "procedural")
+
+
+def _check_memory_type(memory_type: str | None) -> str | None:
+    """Reject an unknown ``memory_type`` before any request is made."""
+    if memory_type is not None and memory_type not in MEMORY_TYPES:
+        raise ValueError(
+            f"memory_type must be one of {', '.join(MEMORY_TYPES)}; got {memory_type!r}"
+        )
+    return memory_type
+
+
+def _recall_filters(
+    filters: dict[str, Any] | None,
+    memory_type: str | None,
+    conversation_id: str | None,
+) -> dict[str, Any] | None:
+    """Merge the ``memory_type``/``conversation_id`` shortcuts into a filters dict.
+
+    Returns ``None`` when there is nothing to send, so a call that sets neither
+    shortcut (and passes no ``filters``) builds the same payload as before.
+    """
+    merged: dict[str, Any] = dict(filters) if filters else {}
+    if _check_memory_type(memory_type) is not None:
+        merged["memory_type"] = memory_type
+    if conversation_id is not None:
+        merged["conversation_id"] = conversation_id
+    return merged or None
+
+
 @dataclass
 class MemoryMetadata:
     """Metadata attached to a memory item."""
@@ -154,6 +188,7 @@ class MemoryMetadata:
     conversation_id: str | None = None
     confidence: float | None = None
     salience: float | None = None
+    memory_type: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     last_accessed_at: str | None = None
@@ -167,6 +202,7 @@ class MemoryMetadata:
             conversation_id=data.get("conversation_id"),
             confidence=data.get("confidence"),
             salience=data.get("salience"),
+            memory_type=data.get("memory_type"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             last_accessed_at=data.get("last_accessed_at"),
@@ -184,7 +220,9 @@ class MemoryItem:
         content: The memory content text.
         version: Version counter for this memory.
         metadata: Associated metadata (tags, source, timestamps).
-        score: Relevance score from vector search (None for non-query results).
+        score: Similarity to the query text (0 to 1) for durable scopes (user,
+            agent, tenant). Always ``None`` for ``run`` and ``task`` scope: those
+            are plain key-value reads, never similarity-ranked.
     """
 
     memory_id: str
@@ -305,6 +343,36 @@ class ProposalStatus:
 
 
 @dataclass
+class UpdateResult:
+    """Result of a ``memory.update`` call.
+
+    Attributes:
+        memory_id: ID of the updated memory.
+        scope: Scope of the memory (always ``agent``).
+        version: The memory's new version. Pass it as ``version`` on the next
+            update; a stale version is rejected with HTTP 409.
+        update_event_id: Opaque event ID for audit trail.
+        updated_at: ISO-8601 timestamp of the update.
+    """
+
+    memory_id: str = ""
+    scope: str = ""
+    version: int = 0
+    update_event_id: str = ""
+    updated_at: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UpdateResult":
+        return cls(
+            memory_id=data.get("memory_id", ""),
+            scope=data.get("scope", ""),
+            version=data.get("version", 0),
+            update_event_id=data.get("update_event_id", ""),
+            updated_at=data.get("updated_at", ""),
+        )
+
+
+@dataclass
 class ForgetResult:
     """Result of a ``memory.forget`` call.
 
@@ -321,6 +389,32 @@ class ForgetResult:
         return cls(
             deleted_count=data.get("deleted_count", 0),
             delete_event_id=data.get("delete_event_id", ""),
+        )
+
+
+@dataclass
+class HintStatus:
+    """Outcome of a consolidation hint this agent submitted.
+
+    Attributes:
+        hint_id: ID returned by ``hint()``.
+        status: ``pending``, ``consolidated``, ``dead_lettered`` or ``expired``.
+        submitted_at: When the service accepted the hint (ISO 8601), if known.
+        resolved_at: When consolidation resolved it (ISO 8601); ``None`` while pending.
+    """
+
+    hint_id: str = ""
+    status: str = "pending"
+    submitted_at: str | None = None
+    resolved_at: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "HintStatus":
+        return cls(
+            hint_id=data.get("hint_id", ""),
+            status=data.get("status", "pending"),
+            submitted_at=data.get("submitted_at"),
+            resolved_at=data.get("resolved_at"),
         )
 
 
@@ -636,10 +730,10 @@ class MemoryClient:
                         except ValueError:
                             pass
                 raise NovaOSServerError(
-                    f"Memory Service returned HTTP {e.response.status_code}: {e}",
+                    status_error_message("Memory Service", e),
                     status_code=e.response.status_code,
                     retry_after=retry_after,
-                    details={"original_error": type(e).__name__},
+                    details=status_error_details(e),
                 ) from e
 
             envelope = response.json()
@@ -745,10 +839,10 @@ class MemoryClient:
                     except ValueError:
                         pass
             raise NovaOSServerError(
-                f"Memory Service returned HTTP {e.response.status_code}: {e}",
+                status_error_message("Memory Service", e),
                 status_code=e.response.status_code,
                 retry_after=retry_after,
-                details={"original_error": type(e).__name__},
+                details=status_error_details(e),
             ) from e
 
         envelope = response.json()
@@ -775,6 +869,10 @@ class MemoryClient:
         *,
         top_k: int = 10,
         filters: dict[str, Any] | None = None,
+        memory_type: MemoryType | None = None,
+        conversation_id: str | None = None,
+        token_budget: int | None = None,
+        latency_budget_ms: int | None = None,
         request_id: str | None = None,
         trace_id: str | None = None,
     ) -> QueryResult:
@@ -784,20 +882,38 @@ class MemoryClient:
             scope: Memory scope to query (``user``, ``agent``, ``run``, ``tenant``).
             query: Natural language query for semantic search.
             top_k: Maximum number of results (1-100, default 10).
-            filters: Optional filters (``tags``, ``after``, ``before``).
+            filters: Optional filters (``tags``, ``after``, ``before``,
+                ``classification``).
+            memory_type: Optional. Only return memories written with this type
+                (``semantic``, ``episodic`` or ``procedural``). Applied before
+                ``top_k``, so every match up to ``top_k`` comes back. Memories
+                written without a type never match. Shortcut for
+                ``filters["memory_type"]``.
+            conversation_id: Optional. Recall durable memories written under this
+                conversation id, ranked by similarity to ``query``. Applies to
+                durable scopes only (``user``, ``agent``, ``tenant``); ignored for
+                ``run``/``task``. Shortcut for ``filters["conversation_id"]``.
+            token_budget: Optional token budget for the result set.
+            latency_budget_ms: Optional latency budget in milliseconds.
             request_id: Optional request ID for tracing.
             trace_id: Optional trace ID for correlation.
 
         Returns:
             QueryResult with matching items and retrieval metadata.
         """
+        budget: dict[str, Any] = {"top_k": top_k}
+        if token_budget is not None:
+            budget["token_budget"] = token_budget
+        if latency_budget_ms is not None:
+            budget["latency_budget_ms"] = latency_budget_ms
         payload: dict[str, Any] = {
             "scope": scope,
             "query": query,
-            "budget": {"top_k": top_k},
+            "budget": budget,
         }
-        if filters:
-            payload["filters"] = filters
+        recall_filters = _recall_filters(filters, memory_type, conversation_id)
+        if recall_filters:
+            payload["filters"] = recall_filters
 
         data = await self._send_mcp(
             "memory.query",
@@ -816,6 +932,9 @@ class MemoryClient:
         source: str | None = None,
         confidence: float | None = None,
         custom: dict[str, Any] | None = None,
+        memory_type: MemoryType | None = None,
+        ttl_seconds: int | None = None,
+        classification: str | None = None,
         idempotency_key: str | None = None,
         ctx: "AgentExecutionContext | None" = None,
         request_id: str | None = None,
@@ -839,6 +958,15 @@ class MemoryClient:
             source: Optional source identifier.
             confidence: Optional confidence score (0.0-1.0).
             custom: Optional custom metadata dict.
+            memory_type: Optional kind of the memory (``semantic``, ``episodic``
+                or ``procedural``). Omitted: nothing extra is stored and the
+                memory matches no ``memory_type`` query filter.
+            ttl_seconds: Optional lifetime of the memory in seconds (the service
+                enforces its own minimum and per-scope maximum and rejects a value
+                outside them). Omitted: the scope's default lifetime applies.
+            classification: Optional classification label (``inferred``,
+                ``explicit``, ``system``, ``confidential``). Omitted: the
+                service default applies.
             idempotency_key: Optional key for write idempotency (24h TTL). If
                 omitted and ``ctx`` is given, derived from
                 ``ctx.idempotency_key`` plus a per-execution ordinal (tracked
@@ -866,6 +994,8 @@ class MemoryClient:
             metadata["confidence"] = confidence
         if custom is not None:
             metadata["custom"] = custom
+        if _check_memory_type(memory_type) is not None:
+            metadata["memory_type"] = memory_type
 
         payload: dict[str, Any] = {
             "scope": scope,
@@ -873,6 +1003,10 @@ class MemoryClient:
         }
         if metadata:
             payload["metadata"] = metadata
+        if ttl_seconds is not None:
+            payload["ttl_seconds"] = ttl_seconds
+        if classification is not None:
+            payload["classification"] = classification
 
         if idempotency_key is None:
             ctx_key = getattr(ctx, "idempotency_key", None) if ctx is not None else None
@@ -924,6 +1058,82 @@ class MemoryClient:
             trace_id=trace_id,
         )
         return ProposalStatus.from_dict(data)
+
+    async def update(
+        self,
+        scope: str,
+        memory_id: str,
+        version: int,
+        *,
+        content: str | None = None,
+        tags: list[str] | None = None,
+        confidence: float | None = None,
+        custom: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> UpdateResult:
+        """Update one of the agent's own memories in place.
+
+        Applies immediately (no proposal gate), so the next :meth:`query` returns
+        the new content. Only ``agent``-scope memories can be updated; ``user``
+        and ``tenant`` are refused for agent principals, and ``run``/``task``
+        memories are ephemeral — :meth:`forget` and write a new one instead.
+        New ``content`` is screened for PII and secrets and rejected on a hit.
+
+        Args:
+            scope: Memory scope — ``agent``.
+            memory_id: ID of the committed memory (the ``memory_id`` on a
+                :class:`MemoryItem` from :meth:`query`, not a ``prop_`` proposal ID).
+            version: The memory's ``version`` as last read from :meth:`query`.
+                Used as an optimistic lock: if the memory changed since, the call
+                fails with HTTP 409 — re-read and retry.
+            content: Optional new content (max 32 KB).
+            tags: Optional replacement tags (max 20, each max 64 chars).
+            confidence: Optional new confidence score (0.0-1.0).
+            custom: Optional replacement custom metadata dict.
+            request_id: Optional request ID for tracing.
+            trace_id: Optional trace ID for correlation.
+
+        Returns:
+            UpdateResult with the memory's new version.
+
+        Raises:
+            NovaOSValidationError: If none of ``content``, ``tags``,
+                ``confidence`` or ``custom`` is given.
+            NovaOSServerError: HTTP 409 on a stale ``version``; 404 if the
+                memory is not found; 403 if it belongs to another agent;
+                422 for a scope that cannot be updated or content rejected by
+                the PII/secret screen.
+        """
+        metadata: dict[str, Any] = {}
+        if tags is not None:
+            metadata["tags"] = tags
+        if confidence is not None:
+            metadata["confidence"] = confidence
+        if custom is not None:
+            metadata["custom"] = custom
+        if content is None and not metadata:
+            raise NovaOSValidationError(
+                "update needs at least one of content, tags, confidence or custom"
+            )
+
+        payload: dict[str, Any] = {
+            "scope": scope,
+            "memory_id": memory_id,
+            "version": version,
+        }
+        if content is not None:
+            payload["content"] = content
+        if metadata:
+            payload["metadata"] = metadata
+
+        data = await self._send_mcp(
+            "memory.update",
+            payload,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
+        return UpdateResult.from_dict(data)
 
     async def forget(
         self,
@@ -1039,6 +1249,32 @@ class MemoryClient:
         )
         return HintResult.from_dict(data)
 
+    async def hint_status(
+        self,
+        hint_id: str,
+        *,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> HintStatus:
+        """Read the outcome of a hint this agent submitted.
+
+        ``hint()`` only says the hint was accepted. This says whether
+        consolidation stored it: ``pending`` until the cycle resolves it, then
+        ``consolidated`` or ``dead_lettered``; ``expired`` if it stayed pending
+        for over an hour. State is kept for 24 hours.
+
+        Raises:
+            NovaOSServerError: HTTP 404 if the hint is unknown, has aged out, or was
+                submitted by a different agent.
+        """
+        data = await self._send_mcp(
+            "memory.hint_status",
+            {"hint_id": hint_id},
+            request_id=request_id,
+            trace_id=trace_id,
+        )
+        return HintStatus.from_dict(data)
+
     async def assemble_context(
         self,
         query: str,
@@ -1047,6 +1283,8 @@ class MemoryClient:
         live_message_limit: int = 20,
         token_budget: int | None = None,
         latency_budget_ms: int | None = None,
+        memory_type: MemoryType | None = None,
+        conversation_id: str | None = None,
         ctx: "AgentExecutionContext | None" = None,
         request_id: str | None = None,
         trace_id: str | None = None,
@@ -1067,6 +1305,12 @@ class MemoryClient:
             latency_budget_ms: Per-turn latency budget in milliseconds, if the
                 caller has one. ``None`` leaves the server's own default in
                 place.
+            memory_type: Optional. Only include durable memories written with
+                this type (``semantic``, ``episodic`` or ``procedural``); also
+                narrows run and task data. Omitted: no type filtering.
+            conversation_id: Optional. Restrict durable recall to memories written
+                under this conversation id (similarity-ranked). Opt-in; omitted:
+                recall spans all conversations as before.
             ctx: The calling agent's execution context. Supplies
                 ``request_id``/``trace_id`` from ``ctx.run_id``/``ctx.trace_id``
                 when those aren't passed explicitly.
@@ -1079,7 +1323,9 @@ class MemoryClient:
         Note:
             The Memory Service scopes live messages to the caller's
             conversation from its own token claims, not from anything in this
-            call's payload — there is no ``conversation_id`` parameter here.
+            call's payload. ``conversation_id`` here is a different thing: an
+            opt-in *recall filter* over durable memories written under that
+            conversation id, not the conversation the live messages come from.
         """
         budget: dict[str, Any] = {
             "top_k": top_k,
@@ -1094,6 +1340,9 @@ class MemoryClient:
             "query": query,
             "budget": budget,
         }
+        recall_filters = _recall_filters(None, memory_type, conversation_id)
+        if recall_filters:
+            payload["filters"] = recall_filters
 
         data = await self._send_mcp(
             "memory.assemble",

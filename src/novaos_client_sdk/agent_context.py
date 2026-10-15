@@ -40,7 +40,7 @@ Ported from NovaOs/packages/agent-sdk/python/novaos_sdk/context.py
 import asyncio
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from .a2a_extensions import ExtensionActivation
@@ -49,6 +49,7 @@ from .a2a_task_updater import TaskUpdater
 from .a2a_types import A2AMessage, as_dict, as_str
 from .agent_types import AgentRuntimeContext, ConversationTurn
 from .exceptions import SecretNotDeliveredError
+from .header_safety import filter_custom_headers
 from .logging import get_agent_logger
 from .tools import ToolBindings
 from .tracing import configure_otel, extract_parent_id, extract_trace_id
@@ -325,8 +326,14 @@ class AgentExecutionContext:
         cancellation: "_CancellationToken | None" = None,
         referenced_tasks: tuple[Task, ...] = (),
         unresolved_reference_task_ids: tuple[str, ...] = (),
+        custom_headers: Mapping[str, str] | None = None,
     ):
         self._ctx = execution_context
+        # The caller's `custom_headers`, filtered. Held on the context itself, not
+        # in request-scoped storage, so a streaming skill task that starts after
+        # the endpoint handler has returned still sees them. Values are
+        # credential-equivalent: only ever log `len(custom_headers)`.
+        self._custom_headers: dict[str, str] = filter_custom_headers(custom_headers or {})
         # Resolved by `AgentBuilder` *before* this object is
         # constructed — see `referenced_tasks`'s own docstring for why
         # resolution happens there rather than lazily here.
@@ -380,6 +387,7 @@ class AgentExecutionContext:
         if execution_context.traceparent:
             self.tools.set_traceparent(execution_context.traceparent)
         self.tools.set_run_id(execution_context.run_id)
+        self.tools.set_custom_headers(self._custom_headers)
         # `emit_tool_event` is only ever non-None for a streaming request —
         # see the parameter's docstring above.
         if emit_tool_event is not None:
@@ -679,6 +687,22 @@ class AgentExecutionContext:
         a HITL continuation reuses.
         """
         return self._ctx.idempotency_key
+
+    @property
+    def custom_headers(self) -> dict[str, str]:
+        """The caller's ``custom_headers`` for this request, lower-cased and filtered.
+
+        Service-account callers pass ``custom_headers`` on execute; the platform
+        delivers them as request headers. Only names that pass
+        :func:`~novaos_client_sdk.header_safety.is_safe_custom_header_name` are
+        kept, so platform-owned headers (``Authorization``, ``X-NovaOS-*``,
+        ``traceparent``, ...) never appear here. Every ``ctx.tools.*`` call
+        already forwards them, so a skill only needs this to read a value.
+
+        Returns a copy. Values may carry credentials (an end-user JWT): do not
+        log them.
+        """
+        return dict(self._custom_headers)
 
     @property
     def mcp_write_hitl_active(self) -> bool:
@@ -1060,6 +1084,7 @@ class AgentExecutionContext:
             cancellation=cancellation,
             referenced_tasks=referenced_tasks,
             unresolved_reference_task_ids=unresolved_reference_task_ids,
+            custom_headers=headers,
         )
         raw_entity_refs = novaos_context.get("entity_refs", [])
         if isinstance(raw_entity_refs, list) and raw_entity_refs:

@@ -13,6 +13,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._idna import wire_hostname as _wire_hostname
+from novaos_client_sdk._idna import wire_suffix as _wire_suffix
+from novaos_client_sdk._ssrf import is_blocked_ip
 from novaos_client_sdk.client import Client
 from novaos_client_sdk.exceptions import (
     NovaOSDNSAgentNotFoundError,
@@ -88,9 +91,10 @@ def validate_agent_url(
         raise NovaOSError(f"Malformed URL {url!r}: {exc}") from exc
     if not hostname:
         raise NovaOSError(f"Invalid URL format: {url}")
+    hostname = _wire_hostname(hostname)
 
     if allowed_suffixes:
-        valid_suffixes = [s for s in allowed_suffixes if s]
+        valid_suffixes = [_wire_suffix(s) for s in allowed_suffixes if s]
         if valid_suffixes and not any(
             _hostname_matches_suffix(hostname, suffix) for suffix in valid_suffixes
         ):
@@ -110,9 +114,7 @@ def validate_agent_url(
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
             continue
-        if not allow_private_ips and (
-            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-        ):
+        if not allow_private_ips and is_blocked_ip(ip):
             raise NovaOSError(f"Resolved IP {ip_str} for host '{hostname}' is in a blocked range")
 
 
@@ -317,7 +319,9 @@ class AgentDNSRecord:
             Client instance configured with this agent's URL
         """
         validate_agent_url(self.url, allowed_host_suffixes, allow_private_ips=trust_url)
-        return Client(base_url=self.url, **client_kwargs)
+        return Client(
+            base_url=self.url, guard_connect_ips=True, allow_private_ips=trust_url, **client_kwargs
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""

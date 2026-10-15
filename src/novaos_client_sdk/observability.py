@@ -3,8 +3,9 @@
 Wraps two confirmed Gateway REST endpoints for inspecting and controlling a
 live agent run:
 
-* **EventIndex** — ``GET /api/v1/service/runs/:runId/events``: paginated
-  history of a run's events.
+* **EventIndex** — ``GET /api/v1/service/runs/:runId/events`` (service-account
+  callers) or ``GET /api/v1/runs/:runId/events`` (user callers): history of a
+  run's events.
 * **DebugSession** — ``POST /api/v1/runs/:runId/debug/:action``: pause / resume /
   step / abort control of a live run, part of the platform's "Agent
   Debugger Platform".
@@ -19,22 +20,24 @@ live agent run:
 
 .. admonition:: Auth requirements differ per endpoint — read before use
 
-   ``get_run_events`` is guarded on the platform side by service-account
-   bearer auth plus a revocation check
-   (``saAuthPreHandler`` + ``assertSaNotRevoked``) — it is **not**
-   necessarily reachable with a typical agent's own execution token. Confirm
-   your caller holds an appropriately scoped service-account token before
-   relying on this in a skill; a 401/403 here most likely means the token
-   in ``headers`` isn't a service-account token, not that the endpoint is
-   unreachable. ``send_debug_control`` uses a more general bearer-auth guard.
+   The platform serves run events on two routes. The service route
+   (``/api/v1/service/runs/:runId/events``) is guarded by service-account
+   bearer auth plus a revocation check (``saAuthPreHandler`` +
+   ``assertSaNotRevoked``) and answers 403 to a user token. The user route
+   (``/api/v1/runs/:runId/events``) serves a user's own runs.
+   ``get_run_events`` picks between them via its ``route`` argument; the
+   default ``"auto"`` tries the service route and falls back to the user
+   route on a 403. ``send_debug_control`` uses a more general bearer-auth
+   guard.
 
 Endpoint contract: the events route and the debug-control
 route are both shipped with full test coverage as part of the platform's
 "Agent Debugger Platform". The ``EventIndex``/``DebugSession`` models
-backing these live in the platform's shared schema. Event responses do not
-currently include ``trace_id``/``span_id`` — that column doesn't exist on
-the ``EventIndex`` table yet — but this does not affect ``get_run_events``
-itself.
+backing these live in the platform's shared schema. ``EventIndex`` stores
+``trace_id``/``span_id``, but older platform builds do not return them on
+either events route, so :attr:`RunEvent.trace_id` / ``span_id`` may be
+``None``. ``sequence`` is returned by the user route on every build, and by
+the service route only on newer builds.
 
 ⚠️ Both routes are registered on the Gateway *without* an ``/api/v1``
 prefix in the literal route-definition call — the prefix is applied
@@ -57,6 +60,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_details, status_error_message
 from novaos_client_sdk._resilience import CircuitBreaker as _CircuitBreaker
 from novaos_client_sdk._resilience import backoff_delay
 from novaos_client_sdk.exceptions import (
@@ -71,6 +75,10 @@ logger = logging.getLogger(__name__)
 NOVAOS_GATEWAY_URL_ENV = "NOVAOS_GATEWAY_URL"
 
 DebugAction = Literal["pause", "resume", "step", "abort"]
+EventsRoute = Literal["auto", "user", "service"]
+
+_SERVICE_EVENTS_PATH = "/api/v1/service/runs/{run_id}/events"
+_USER_EVENTS_PATH = "/api/v1/runs/{run_id}/events"
 
 
 # ---------------------------------------------------------------------------
@@ -83,24 +91,39 @@ class RunEvent:
     """A single event from a run's event history.
 
     Attributes:
-        event_id: Unique identifier for this event.
+        event_id: Unique identifier for this event. Empty on the user route,
+            which does not return one.
         type: Event type (e.g. tool call, status transition).
         data: Event payload — shape varies by ``type``.
         timestamp: ISO-8601 timestamp of the event.
+        sequence: Per-run ordering number, or ``None`` when the route does
+            not return it (the service route).
+        trace_id: Trace ID the platform stored for this event, if any.
+        span_id: Span ID the platform stored for this event, if any.
     """
 
     event_id: str = ""
     type: str = ""
     data: dict[str, Any] = field(default_factory=dict)
     timestamp: str = ""
+    sequence: int | None = None
+    trace_id: str | None = None
+    span_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunEvent:
+        # The service route calls the payload ``data``; the user route calls it ``payload``.
+        payload = data.get("data")
+        if payload is None:
+            payload = data.get("payload")
         return cls(
             event_id=data.get("event_id", ""),
             type=data.get("type", ""),
-            data=data.get("data", {}),
+            data=payload if payload is not None else {},
             timestamp=data.get("timestamp", ""),
+            sequence=data.get("sequence"),
+            trace_id=data.get("trace_id"),
+            span_id=data.get("span_id"),
         )
 
 
@@ -128,6 +151,22 @@ class RunEventsPage:
             events=[RunEvent.from_dict(e) for e in data.get("data", [])],
             next_cursor=cursor.get("next"),
             request_id=meta.get("request_id", ""),
+        )
+
+    @classmethod
+    def from_user_route_dict(cls, data: dict[str, Any]) -> RunEventsPage:
+        """Parse the user route's ``{"events": [...]}`` body.
+
+        That route has no cursor envelope, so ``next_cursor`` is the last
+        returned event's ``sequence`` (the same cursor format the service route
+        uses). It is ``None`` only once a page comes back empty, so a
+        ``while page.next_cursor`` loop ends with one empty request.
+        """
+        events = [RunEvent.from_dict(e) for e in data.get("events", [])]
+        last_sequence = events[-1].sequence if events else None
+        return cls(
+            events=events,
+            next_cursor=str(last_sequence) if last_sequence is not None else None,
         )
 
 
@@ -170,9 +209,9 @@ class ObservabilityClient:
         base_url: Gateway base URL. If ``None``, reads from
             ``NOVAOS_GATEWAY_URL`` env var.
         headers: Additional HTTP headers — typically
-            ``{"Authorization": "Bearer <token>"}``. See the module docstring
-            on auth: ``get_run_events`` needs a service-account token
-            specifically, not necessarily an agent's own execution token.
+            ``{"Authorization": "Bearer <token>"}``. A user token or a
+            service-account token both work with ``get_run_events``; see the
+            module docstring.
         timeout: Request timeout in seconds (default: 30).
         max_retries: Maximum retry attempts for :meth:`get_run_events`
             (default: 3). :meth:`send_debug_control` is never auto-retried —
@@ -221,6 +260,7 @@ class ObservabilityClient:
         self._client: httpx.AsyncClient | None = None
         self._injected_client = client
         self._owns_client: bool = False
+        self._events_route: Literal["user", "service"] | None = None
 
     async def __aenter__(self) -> ObservabilityClient:
         """Async context manager entry."""
@@ -251,7 +291,8 @@ class ObservabilityClient:
         return self._client
 
     # ------------------------------------------------------------------
-    # EventIndex — GET /api/v1/service/runs/:runId/events
+    # EventIndex — GET /api/v1/service/runs/:runId/events (service account)
+    #              GET /api/v1/runs/:runId/events          (user)
     # ------------------------------------------------------------------
 
     async def get_run_events(
@@ -260,6 +301,7 @@ class ObservabilityClient:
         *,
         after: str | None = None,
         limit: int | None = None,
+        route: EventsRoute = "auto",
     ) -> RunEventsPage:
         """Fetch one page of a run's event history.
 
@@ -271,19 +313,50 @@ class ObservabilityClient:
             after: Opaque cursor from a prior :class:`RunEventsPage`'s
                 ``next_cursor``, to continue pagination.
             limit: Maximum events to return in this page (server-defined
-                default/max apply if omitted).
+                default/max apply if omitted). Only the service route honours
+                it; the user route uses a fixed server-side page size.
+            route: ``"service"`` for the service-account route, ``"user"`` for
+                the user route (a user token reading its own run), or
+                ``"auto"`` (default) to try the service route and fall back
+                to the user route on a 403. The route that worked is
+                remembered for later ``"auto"`` calls on this client.
 
         Returns:
             One page of events plus a cursor for the next page.
         """
+        if route == "auto":
+            if self._events_route is not None:
+                route = self._events_route
+            else:
+                try:
+                    page = await self._get_events_page(run_id, after, limit, "service")
+                except NovaOSServerError as e:
+                    if e.status_code != 403:
+                        raise
+                    page = await self._get_events_page(run_id, after, limit, "user")
+                    self._events_route = "user"
+                else:
+                    self._events_route = "service"
+                return page
+        return await self._get_events_page(run_id, after, limit, route)
+
+    async def _get_events_page(
+        self,
+        run_id: str,
+        after: str | None,
+        limit: int | None,
+        route: Literal["user", "service"],
+    ) -> RunEventsPage:
         params: dict[str, str] = {}
         if after:
             params["after"] = after
-        if limit is not None:
-            params["limit"] = str(limit)
-
-        data = await self._get_with_retry(f"/api/v1/service/runs/{run_id}/events", params)
-        return RunEventsPage.from_dict(data)
+        if route == "service":
+            if limit is not None:
+                params["limit"] = str(limit)
+            data = await self._get_with_retry(_SERVICE_EVENTS_PATH.format(run_id=run_id), params)
+            return RunEventsPage.from_dict(data)
+        data = await self._get_with_retry(_USER_EVENTS_PATH.format(run_id=run_id), params)
+        return RunEventsPage.from_user_route_dict(data)
 
     async def _get_with_retry(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         """GET with retry + circuit breaker (mirrors MemoryClient._send_mcp)."""
@@ -345,10 +418,10 @@ class ObservabilityClient:
                         except ValueError:
                             pass
                 raise NovaOSServerError(
-                    f"Gateway returned HTTP {e.response.status_code}: {e}",
+                    status_error_message("Gateway", e),
                     status_code=e.response.status_code,
                     retry_after=retry_after,
-                    details={"original_error": type(e).__name__},
+                    details=status_error_details(e),
                 ) from e
 
             result: dict[str, Any] = response.json()
@@ -406,9 +479,9 @@ class ObservabilityClient:
                 ) from e
             except httpx.HTTPStatusError as e:
                 raise NovaOSServerError(
-                    f"Gateway returned HTTP {e.response.status_code} for debug control: {e}",
+                    status_error_message("Gateway", e, context=" for debug control"),
                     status_code=e.response.status_code,
-                    details={"original_error": type(e).__name__},
+                    details=status_error_details(e),
                 ) from e
 
             return DebugControlResult.from_dict(response.json())

@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal
 
 from novaos_client_sdk import config as _config
@@ -35,9 +35,11 @@ from novaos_client_sdk._resilience import (
     backoff_delay as _backoff_delay,
 )
 from novaos_client_sdk.hitl_effect import MCP_TOOLS_CALL_WRITE, mcp_tool_action_class
+from novaos_client_sdk.memory import MemoryType, _check_memory_type, _recall_filters
 from novaos_client_sdk.tracing import get_traceparent, inject_trace_headers, traced_tool_call
 
 from .agent_types import ToolResponse
+from .header_safety import filter_custom_headers
 
 _logger = logging.getLogger(__name__)
 
@@ -145,7 +147,11 @@ def _connector_fqn(connector_id: str, operation: str, tier: str = "standard") ->
 
 
 # Terminal statuses for RAG ingestion jobs (JobStatus enum in nova-os-rag).
-_RAG_TERMINAL_STATUSES = frozenset({"completed", "failed", "dead_letter", "duplicate"})
+# A re-upload of identical content finishes as "completed" with ``duplicate_of``
+# set to the original document's id; "duplicate" is kept as terminal only so a
+# service that reports it as a status can never leave a poll hanging.
+# "cancelled" is what a job becomes when its collection is deleted mid-ingest.
+_RAG_TERMINAL_STATUSES = frozenset({"completed", "failed", "dead_letter", "cancelled", "duplicate"})
 
 # submit_error is terminal at the SDK layer (the job was never queued on the backend).
 _BATCH_TERMINAL_STATUSES = _RAG_TERMINAL_STATUSES | {"submit_error"}
@@ -179,16 +185,26 @@ class IngestJobStatus:
             :meth:`KnowledgeTool.ingest_batch` call.
         job_id: Backend job UUID, or ``None`` when submission itself failed.
         status: One of ``"pending"``, ``"running"``, ``"completed"``,
-            ``"failed"``, ``"dead_letter"``, ``"duplicate"``,
+            ``"failed"``, ``"dead_letter"``, ``"cancelled"``,
             ``"submit_error"``, or ``"unknown"``.
         error: Human-readable error message when *status* is ``"failed"``,
             ``"dead_letter"``, or ``"submit_error"``; ``None`` otherwise.
+        duplicate_of: Id of the existing document when the upload was a
+            duplicate of content already indexed (the job itself finishes as
+            ``"completed"``); ``None`` otherwise.
+        is_duplicate: ``True`` when :attr:`duplicate_of` is set, or when the
+            service reports the status ``"duplicate"``.
     """
 
     index: int
     job_id: str | None
     status: str
     error: str | None = None
+    duplicate_of: str | None = None
+
+    @property
+    def is_duplicate(self) -> bool:
+        return bool(self.duplicate_of) or self.status == "duplicate"
 
 
 @dataclasses.dataclass
@@ -243,6 +259,9 @@ class _BaseToolBinding:
         # it as an attribute (novaos.run_id) for correlation with the platform's
         # own run records — see `traced_tool_call`.
         self._per_request_run_id: str = ""
+        # Caller-supplied `custom_headers` for the current request, already
+        # filtered by `filter_custom_headers`. Forwarded on every tool call.
+        self._custom_headers: dict[str, str] = {}
         # Set by AgentExecutionContext for a streaming request. `None`
         # — the default, and what every non-streaming call keeps — means "emit
         # nothing", so a skill invoked outside a streaming request behaves exactly
@@ -280,6 +299,26 @@ class _BaseToolBinding:
         is known, mirroring :meth:`set_traceparent`.
         """
         self._per_request_run_id = run_id
+
+    def set_custom_headers(self, custom_headers: Mapping[str, str]) -> None:
+        """Forward the caller's ``custom_headers`` on every tool call this binding makes.
+
+        Called by :class:`~novaos_client_sdk.agent_context.AgentExecutionContext`
+        with the headers it already filtered. They are copied, filtered again, and
+        never override a header the SDK sets itself, ``Authorization`` included.
+        """
+        self._custom_headers = filter_custom_headers(custom_headers)
+
+    def _with_custom_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        """Add the caller's custom headers beneath the SDK's own.
+
+        An SDK-set header always wins, whatever its casing.
+        """
+        taken = {name.lower() for name in headers}
+        headers.update(
+            {name: value for name, value in self._custom_headers.items() if name not in taken}
+        )
+        return headers
 
     def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         """Push one event to :attr:`_event_sink`, if a streaming request set one."""
@@ -350,6 +389,7 @@ class _BaseToolBinding:
 
         if self._entity_refs:
             headers["X-NovaOS-Entity-Refs"] = json.dumps(self._entity_refs)
+        self._with_custom_headers(headers)
 
         effective_timeout = timeout_s if timeout_s is not None else self._default_timeout_s
         _config.validate_tool_timeout(effective_timeout, self._gateway_timeout_s)
@@ -518,6 +558,7 @@ class _BaseToolBinding:
                 }
                 if self._entity_refs:
                     headers["X-NovaOS-Entity-Refs"] = json.dumps(self._entity_refs)
+                self._with_custom_headers(headers)
                 inject_trace_headers(headers)
                 # Per-request traceparent ALWAYS wins over whatever inject_trace_headers set
                 # (which may be a stale TRACEPARENT env var from pod startup in fleet mode).
@@ -859,7 +900,10 @@ class KnowledgeTool(_BaseToolBinding):
 
         Returns a :class:`ToolResponse` whose ``data`` contains at minimum
         ``status`` (one of ``"pending"``, ``"running"``, ``"completed"``,
-        ``"failed"``, ``"dead_letter"``) and optionally ``error`` on failure.
+        ``"failed"``, ``"dead_letter"``, ``"cancelled"``) and optionally ``error`` on failure.
+        When the upload duplicated content that was already indexed, the job
+        is ``"completed"`` and ``duplicate_of`` holds the original document's
+        id (also the job's ``document_id``).
 
         Uses this binding's ``default_timeout_s`` (128s by default) unless
         ``timeout_s`` overrides it — status polls should normally be fast. The
@@ -890,7 +934,10 @@ class KnowledgeTool(_BaseToolBinding):
         """Block (async) until the ingestion job reaches a terminal state.
 
         Terminal states: ``"completed"``, ``"failed"``, ``"dead_letter"``,
-        ``"duplicate"``.
+        ``"cancelled"`` (the job's collection was deleted before it finished).
+        A duplicate upload is a ``"completed"`` job whose ``data`` carries
+        ``duplicate_of`` (the original document's id); check that field rather
+        than a status.
 
         Returns the final :class:`ToolResponse` from :meth:`get_job_status`
         (``data`` is already unwrapped — access ``resp.data["status"]``
@@ -1150,6 +1197,7 @@ class KnowledgeTool(_BaseToolBinding):
             job_id=job_id,
             status=data.get("status", "unknown"),
             error=data.get("error"),
+            duplicate_of=data.get("duplicate_of") or None,
         )
 
     async def poll_batch_until_complete(
@@ -1246,6 +1294,7 @@ class KnowledgeTool(_BaseToolBinding):
                         job_id=upd.job_id,
                         status=upd.status,
                         error=upd.error,
+                        duplicate_of=upd.duplicate_of,
                     )
             await asyncio.sleep(poll_interval_s)
 
@@ -1367,7 +1416,12 @@ class FilesTool(_BaseToolBinding):
 
 
 class MemoryTool(_BaseToolBinding):
-    """Durable memory storage and retrieval (user/agent/tenant/run/task scope)."""
+    """Governed door to Memory Service: all six ``novaos.memory.*`` tools.
+
+    Every field Memory Service accepts on the agent door is reachable from here;
+    ``tests/test_memory_contract.py`` fails if the service schema and these
+    signatures drift apart.
+    """
 
     async def write(
         self,
@@ -1375,11 +1429,23 @@ class MemoryTool(_BaseToolBinding):
         content: str,
         metadata: dict[str, Any] | None = None,
         *,
+        memory_type: MemoryType | None = None,
+        ttl_seconds: int | None = None,
+        classification: str | None = None,
         timeout_s: int | None = None,
     ) -> ToolResponse:
+        """Write a memory. ``memory_type`` (``semantic``, ``episodic`` or
+        ``procedural``) is optional; omitted, nothing extra is stored."""
         args: dict[str, Any] = {"scope": scope, "content": content}
+        if memory_type is not None:
+            _check_memory_type(memory_type)
+            metadata = {**(metadata or {}), "memory_type": memory_type}
         if metadata:
             args["metadata"] = metadata
+        if ttl_seconds is not None:
+            args["ttl_seconds"] = ttl_seconds
+        if classification is not None:
+            args["classification"] = classification
         return await self._call_tool("novaos.memory.write", args, timeout_s=timeout_s)
 
     async def query(
@@ -1389,14 +1455,124 @@ class MemoryTool(_BaseToolBinding):
         top_k: int = 10,
         filters: dict[str, Any] | None = None,
         *,
+        memory_type: MemoryType | None = None,
+        conversation_id: str | None = None,
+        token_budget: int | None = None,
+        latency_budget_ms: int | None = None,
         timeout_s: int | None = None,
     ) -> ToolResponse:
+        """Query memories. Optional ``memory_type`` and ``conversation_id`` narrow
+        durable recall inside the search (shortcuts for the same keys in
+        ``filters``); ``score`` is null for run/task items."""
         # Memory Service rejects unknown top-level arguments; the result limit
         # is only accepted inside `budget`.
-        args: dict[str, Any] = {"scope": scope, "query": query, "budget": {"top_k": top_k}}
-        if filters:
-            args["filters"] = filters
+        budget: dict[str, Any] = {"top_k": top_k}
+        if token_budget is not None:
+            budget["token_budget"] = token_budget
+        if latency_budget_ms is not None:
+            budget["latency_budget_ms"] = latency_budget_ms
+        args: dict[str, Any] = {"scope": scope, "query": query, "budget": budget}
+        recall_filters = _recall_filters(filters, memory_type, conversation_id)
+        if recall_filters:
+            args["filters"] = recall_filters
         return await self._call_tool("novaos.memory.query", args, timeout_s=timeout_s)
+
+    async def update(
+        self,
+        scope: str,
+        memory_id: str,
+        version: int,
+        content: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        *,
+        timeout_s: int | None = None,
+    ) -> ToolResponse:
+        """Update one of the agent's own ``agent``-scope memories in place.
+
+        ``version`` is the item's ``version`` from a prior ``query``; a stale one
+        is rejected (409). ``metadata`` may carry ``tags``, ``confidence`` and
+        ``custom``. At least one of ``content`` or ``metadata`` is required.
+        """
+        args: dict[str, Any] = {"scope": scope, "memory_id": memory_id, "version": version}
+        if content is not None:
+            args["content"] = content
+        if metadata:
+            args["metadata"] = metadata
+        return await self._call_tool("novaos.memory.update", args, timeout_s=timeout_s)
+
+    async def forget(
+        self,
+        scope: str,
+        memory_id: str,
+        reason: str = "agent-requested",
+        *,
+        timeout_s: int | None = None,
+    ) -> ToolResponse:
+        args: dict[str, Any] = {
+            "scope": scope,
+            "selector": {"memory_id": memory_id},
+            "reason": reason,
+        }
+        return await self._call_tool("novaos.memory.forget", args, timeout_s=timeout_s)
+
+    async def hint(
+        self,
+        hint: str,
+        conversation_id: str,
+        priority: str = "normal",
+        tags: list[str] | None = None,
+        context: str | None = None,
+        *,
+        timeout_s: int | None = None,
+    ) -> ToolResponse:
+        args: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "hint": hint,
+            "priority": priority,
+        }
+        hint_metadata: dict[str, Any] = {}
+        if tags is not None:
+            hint_metadata["tags"] = tags
+        if context is not None:
+            hint_metadata["context"] = context
+        if hint_metadata:
+            args["metadata"] = hint_metadata
+        return await self._call_tool("novaos.memory.hint", args, timeout_s=timeout_s)
+
+    async def hint_status(self, hint_id: str, *, timeout_s: int | None = None) -> ToolResponse:
+        return await self._call_tool(
+            "novaos.memory.hint_status", {"hint_id": hint_id}, timeout_s=timeout_s
+        )
+
+    async def proposal_status(
+        self, proposal_id: str, *, timeout_s: int | None = None
+    ) -> ToolResponse:
+        return await self._call_tool(
+            "novaos.memory.proposal_status", {"proposal_id": proposal_id}, timeout_s=timeout_s
+        )
+
+    async def assemble(
+        self,
+        query: str,
+        top_k: int = 10,
+        live_message_limit: int = 20,
+        token_budget: int | None = None,
+        latency_budget_ms: int | None = None,
+        *,
+        memory_type: MemoryType | None = None,
+        conversation_id: str | None = None,
+        timeout_s: int | None = None,
+    ) -> ToolResponse:
+        budget: dict[str, Any] = {"top_k": top_k, "live_message_limit": live_message_limit}
+        if token_budget is not None:
+            budget["token_budget"] = token_budget
+        if latency_budget_ms is not None:
+            budget["latency_budget_ms"] = latency_budget_ms
+        args: dict[str, Any] = {"query": query, "budget": budget}
+        recall_filters = _recall_filters(None, memory_type, conversation_id)
+        if recall_filters:
+            args["filters"] = recall_filters
+        return await self._call_tool("novaos.memory.assemble", args, timeout_s=timeout_s)
 
 
 class NotifyTool(_BaseToolBinding):
@@ -1810,3 +1986,23 @@ class ToolBindings:
             self.connectors,
         ):
             tool.set_run_id(run_id)
+
+    def set_custom_headers(self, custom_headers: Mapping[str, str]) -> None:
+        """Forward the caller's ``custom_headers`` on every tool call of every binding.
+
+        Called once per request by ``AgentExecutionContext``. Names are filtered
+        again here and an SDK-set header such as ``Authorization`` always wins.
+        """
+        for tool in (
+            self.knowledge,
+            self.agents,
+            self.hitl,
+            self.files,
+            self.memory,
+            self.notify,
+            self.http,
+            self.browser,
+            self.code,
+            self.connectors,
+        ):
+            tool.set_custom_headers(custom_headers)

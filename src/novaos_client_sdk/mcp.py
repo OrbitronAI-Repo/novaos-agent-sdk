@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_details, status_error_message
 from novaos_client_sdk.exceptions import (
     NovaOSConnectionError,
     NovaOSError,
@@ -246,9 +247,9 @@ class MCPClient:
             ) from e
         except httpx.HTTPStatusError as e:
             raise NovaOSServerError(
-                f"MCP Gateway returned HTTP {e.response.status_code}: {e}",
+                status_error_message("MCP Gateway", e),
                 status_code=e.response.status_code,
-                details={"original_error": type(e).__name__},
+                details=status_error_details(e),
             ) from e
 
         data = response.json()

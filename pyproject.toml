@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "novaos-agent-sdk"
-version = "2.0.0"
+version = "2.1.0"
 description = "Python client library for connecting to and communicating with AI Agents that implement the Agent2Agent Protocol (A2A), spec v1.0.1"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -72,6 +72,9 @@ classifiers = [
 #    `src/novaos_client_sdk/_a2a_grpc.py`'s module docstring.
 dependencies = [
     "httpx>=0.24.0",
+    # Imported directly by `dns.validate_agent_url` to encode hostnames the
+    # same way httpx does; httpx already requires it.
+    "idna>=3.0",
 ]
 
 [project.optional-dependencies]

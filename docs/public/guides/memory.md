@@ -5,12 +5,12 @@ are two ways to reach it from a skill, and they are not interchangeable:
 
 - **`ctx.memory.client()`** returns a [`MemoryClient`](../reference/api.md#novaos_client_sdk.memory)
   that talks **directly** to Memory Service over `POST /api/v1/mcp`. It exposes the whole memory
-  surface — `write`, `query`, `forget`, `hint`, `assemble_context` — with typed results, retries and
+  surface — `write`, `query`, `update`, `forget`, `hint`, `assemble_context` — with typed results, retries and
   idempotency keys derived from your execution context. This is the path most of this guide
   documents, and the one to use today.
 - **`ctx.tools.memory`** is a [platform tool binding](platform-tools.md) that goes **through the MCP
   Gateway** (`POST {mcp_gateway_url}/mcp/v1/tools/call`, JSON-RPC `tools/call` for
-  `novaos.memory.write` / `novaos.memory.query`). It trades the full surface for Gateway governance:
+  the six `novaos.memory.*` tools). It trades typed results and retries for Gateway governance:
   policy, audit, metering and visible tool events. See
   [The governed door](#the-governed-door-ctxtoolsmemory).
 
@@ -23,11 +23,11 @@ Gateway adds controls on top; it never relaxes them.
 | | `ctx.memory.client()` (`MemoryClient`) | `ctx.tools.memory` (`MemoryTool`) |
 |---|---|---|
 | Route | Direct to Memory Service | Through the MCP Gateway, then Memory Service |
-| Operations | `write`, `query`, `forget`, `hint`, `assemble_context` | `write`, `query` only |
+| Operations | `write`, `query`, `update`, `forget`, `hint`, `assemble_context` | `write`, `query`, `update`, `forget`, `hint`, `assemble` |
 | Results | Typed (`WriteResult`, `QueryResult`, `AssembleResult`, ...); raises on failure | Untyped [`ToolResponse`](../reference/api.md#novaos_client_sdk.agent_types) (`success`, `data`, `error`); never raises for a failed call |
 | Retries | Built in (429/502/503/504, connection errors) plus a circuit breaker | None |
 | Write idempotency | Key derived from `ctx.idempotency_key` when you pass `ctx=ctx` | None |
-| Governance | Memory Service's own policy | Gateway OPA policy, audit (`MEMORY_RETRIEVAL_REQUEST`, `TOOL_INVOKED`) and metering (`memory.read` / `memory.write`), then Memory Service's own policy |
+| Governance | Memory Service's own policy | Gateway OPA policy, audit (`MEMORY_RETRIEVAL_REQUEST`, `TOOL_INVOKED`) and metering (`memory.read` / `memory.write`), then Memory Service's own policy. A `write` to `agent`, `run` or `task` scope needs no human approval; any other scope does ([details](#the-governed-door-ctxtoolsmemory)) |
 | Visibility | Not shown as a tool call | `tool.call` / `tool.result` events in the A2A stream on streaming requests |
 | Token needs | `memory:*` scopes | `memory:*` scopes **and** `mcp:tools:memory` (or `mcp:tools:*`) |
 | Status in this release | Supported | Supported |
@@ -132,6 +132,26 @@ async with ctx.memory.client() as memory:
         await memory.hint("User mentioned they are based in Lisbon.", ctx=ctx)
 ```
 
+### Updating a memory in place
+
+`update()` edits one of your own `agent`-scope memories without writing a new one. It applies
+immediately — no proposal — so the next `query()` returns the new content. Read the memory's
+`version` from `query()` and pass it back; if the memory changed in between, the call fails with a
+409 `NovaOSServerError` and you re-read and retry.
+
+The call is `await memory.update("agent", item.memory_id, item.version, content="...")`, where
+`item` is a `MemoryItem` from `memory.query(...)`. The returned `UpdateResult.version` is the
+version to pass on the next update.
+
+- Only `agent` scope can be updated. `user` and `tenant` are refused (422) for agent principals, and
+  `run` / `task` memories are short-lived scratch: `forget()` and write a new one.
+- Pass the committed `memory_id` from `query()`, not a `prop_` proposal id.
+- New `content` goes through the same PII and secret screens as a write and is rejected (422) on a
+  hit. `tags`, `confidence` and `custom` replace the stored values; other metadata is not
+  changeable.
+- `write()` also takes `ttl_seconds` (the service enforces its own minimum and per-scope maximum)
+  and `classification`.
+
 ## Reading memory
 
 ```python
@@ -144,19 +164,44 @@ for item in recalled.items:
     ctx.logger.info("Recalled", extra={"memory_id": item.memory_id, "score": item.score})
 ```
 
-- `query(scope, query, *, top_k=10, filters=None)` searches one scope. Agents can query `user`,
+- `query(scope, query, *, top_k=10, filters=None, memory_type=None, conversation_id=None)`
+  searches one scope. Agents can query `user`,
   `agent` and `run`; `tenant` needs `memory:read:tenant`, which agent tokens don't normally carry.
-  `filters` accepts `tags`, `after` and `before`.
+  `filters` accepts `tags`, `after`, `before` and `classification`. `memory_type` and
+  `conversation_id` are shortcuts for the same two keys in `filters`; see
+  [Typed memories and conversation recall](#typed-memories-and-conversation-recall).
 - `hint(hint, *, conversation_id=None, ctx=None)` submits an observation for background
   consolidation into user memory. It needs a `conversation_id`: pass `ctx=ctx` and it defaults
   from `ctx.context_id`; with neither, the call raises `NovaOSValidationError` before any request
   is sent. `hinted.status == "accepted"` means the hint was durably enqueued — not that a fact will
   result from it.
 - `assemble_context(query, *, top_k=10, live_message_limit=20, token_budget=None,
-  latency_budget_ms=None, ctx=None)` fans out to every source your token can read — user and agent
-  memories, the live conversation, run data — in one call. It has no `conversation_id` parameter:
-  Memory Service scopes live messages from your token's claims. With `ctx=ctx`, `request_id` and
-  `trace_id` default from `ctx.run_id` and `ctx.trace_id`.
+  latency_budget_ms=None, memory_type=None, conversation_id=None, ctx=None)` fans out to every
+  source your token can read — user and agent memories, the live conversation, run data — in one
+  call. Live messages are scoped from your token's claims, not from the `conversation_id`
+  argument, which is an opt-in recall filter over durable memories (below). With `ctx=ctx`,
+  `request_id` and `trace_id` default from `ctx.run_id` and `ctx.trace_id`.
+
+### Typed memories and conversation recall
+
+Both are opt-in. Leave them out and every call behaves exactly as before.
+
+- **`memory_type`** is an optional label on a memory: `"semantic"`, `"episodic"` or
+  `"procedural"` (anything else raises `ValueError`, and the service answers 422). Set it on
+  `write(..., memory_type="episodic")`. Query with `memory_type="episodic"` to get only memories
+  written with that type — every match up to `top_k`, because the service filters before it ranks.
+  A memory written without a type is never returned by a typed query. `run` and `task` scope store
+  and match the type by exact comparison.
+- **`conversation_id`** on `query` and `assemble_context` recalls durable memories written under
+  that conversation, ranked by similarity to your query text, so something saved early in a long
+  conversation is still found after many later turns. It applies to `user`, `agent` and `tenant`
+  scope and is ignored for `run` and `task`, which are plain key-value scratch space.
+- **`item.score`** is the similarity of a durable memory to your query (0 to 1). It is always
+  `None` for `run` and `task` items: those are read from Redis, not similarity-ranked.
+
+For example, `await memory.query("agent", "how do we deploy?", memory_type="procedural")` returns
+only procedural memories, and `await memory.query("user", "invoice currency",
+conversation_id=ctx.context_id)` recalls what was saved under that conversation.
 
 `forget()` deletes one stored memory by id:
 
@@ -262,13 +307,26 @@ don't need your own retry loop around it. `ctx.tools.memory` does not retry.
 
 ## The governed door: `ctx.tools.memory`
 
-`ctx.tools.memory` has two methods, both returning a
+`ctx.tools.memory` has one method per Memory Service tool, each returning a
 [`ToolResponse`](../reference/api.md#novaos_client_sdk.agent_types) instead of raising:
 
-- `write(scope, content, metadata=None, *, timeout_s=None)` calls `novaos.memory.write`.
-  `metadata` accepts `tags`, `source`, `confidence` and `custom`; Memory Service ignores other keys.
-- `query(scope, query, top_k=10, filters=None, *, timeout_s=None)` calls `novaos.memory.query`,
-  sending `top_k` as the tool's `budget.top_k`.
+- `write(scope, content, metadata=None, *, memory_type=None, ttl_seconds=None, classification=None, timeout_s=None)`
+  calls `novaos.memory.write`. `metadata` accepts `tags`, `source`, `confidence` and `custom`;
+  `memory_type` is added to it.
+- `query(scope, query, top_k=10, filters=None, *, memory_type=None, conversation_id=None, token_budget=None, latency_budget_ms=None, timeout_s=None)`
+  calls `novaos.memory.query`, sending `top_k` as the tool's `budget.top_k`.
+- `update(scope, memory_id, version, content=None, metadata=None, *, timeout_s=None)` calls
+  `novaos.memory.update` ([details](#updating-a-memory-in-place)); `metadata` accepts `tags`,
+  `confidence` and `custom`.
+- `forget(scope, memory_id, reason="agent-requested", *, timeout_s=None)` calls
+  `novaos.memory.forget`.
+- `hint(hint, conversation_id, priority="normal", tags=None, context=None, *, timeout_s=None)` calls
+  `novaos.memory.hint`.
+- `assemble(query, top_k=10, live_message_limit=20, token_budget=None, latency_budget_ms=None, *, memory_type=None, conversation_id=None, timeout_s=None)`
+  calls `novaos.memory.assemble`.
+
+`tests/test_memory_contract.py` compares these signatures and `MemoryClient`'s with Memory Service's
+tool schemas, so a field one side accepts cannot go missing from the other.
 
 <!-- doctest: skip reason="needs an MCP Gateway; run against a mocked Gateway by tests/docs/test_memory_guide_tool_samples.py" -->
 ```python
@@ -292,13 +350,21 @@ What going through the Gateway adds:
   checks. Declaring `permissions.tools: ["memory"]` in your manifest turns on
   [pre-fetch](#pre-fetched-context); it does **not** grant that scope. A missing grant surfaces as
   `error == "Tool access denied: novaos.memory.<tool> (category mismatch)"`.
+- **Human approval.** A `write` to `agent`, `run` or `task` scope needs no human approval: it runs
+  on its own and is metered as `memory.write`. A `write` to `user`, `tenant` or `platform` scope, or
+  with a missing or unrecognized scope, needs an approval bound to that call. Without one the call
+  returns `success == False` with `error == "Human approval required before this tool can execute"`.
+  Underneath, the Gateway answered `-32042 HITL_REQUIRED` for action class `mcp.tools.call.write`;
+  the SDK keeps only the message. An agent can't write `user` or `tenant` scope at all (Memory
+  Service rejects it), so in practice an approval doesn't turn those into successful writes.
+  `query` is a read and never needs approval. Operators: the no-approval path needs OPA policy
+  revision `s17-od02-v2` or later; on a v1 policy, agent-scope writes are denied outright.
 - **Audit and metering.** Each call is audited (`MEMORY_RETRIEVAL_REQUEST` / `TOOL_INVOKED`) and
   metered as `memory.read` or `memory.write`.
 - **Visibility.** On a streaming request every call emits a `tool.call` / `tool.result` pair into the
   A2A stream, like every other `ctx.tools` call. Non-streaming requests emit nothing.
 
-What it doesn't have: `forget`, `hint` and `assemble_context`, typed results, retries, and
-ctx-derived idempotency keys. `data` on a successful response is the Gateway's raw MCP tool result.
+What it doesn't have: typed results, retries, and ctx-derived idempotency keys. `data` on a successful response is the Gateway's raw MCP tool result.
 
 ## Consistency guarantees
 
@@ -343,7 +409,7 @@ assert any(item.content == "Customer chose the annual plan." for item in recalle
 - **`ctx.tools.memory` was removed in `2.0.0` and is back.** The `2.0.0`-era binding pointed at
   Gateway tools with no backend and failed `tool not found` everywhere. The binding documented
   [above](#the-governed-door-ctxtoolsmemory) is new, targets real `novaos.memory.*` Gateway tools,
-  and offers only `write` and `query`. If you're carrying over 1.x code that used other methods,
-  move it to `MemoryClient`.
+  and offers one method per `novaos.memory.*` tool: `write`, `query`, `update`, `forget`, `hint`
+  and `assemble`.
 
 See the full reference at [`novaos_client_sdk.memory`](../reference/api.md#novaos_client_sdk.memory).

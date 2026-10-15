@@ -197,6 +197,7 @@ try:
 except ImportError:
     LLMClient = None  # type: ignore[assignment,misc]
 from novaos_client_sdk.capabilities import CapabilityIndex, CapabilityMatcher, MatchResult
+from novaos_client_sdk.catalog import AgentCatalogClient, CatalogAgent
 from novaos_client_sdk.client import Client, ClientConfig
 from novaos_client_sdk.config import (
     Environment,
@@ -251,6 +252,7 @@ from novaos_client_sdk.exceptions import (
 )
 from novaos_client_sdk.gateway import (
     TERMINAL_RUN_STATUSES,
+    Attachment,
     ExecuteResult,
     GatewayClient,
     StreamEvent,
@@ -269,12 +271,15 @@ from novaos_client_sdk.memory import (
     AssembleResult,
     ForgetResult,
     HintResult,
+    HintStatus,
     LiveMessage,
     MemoryClient,
     MemoryItem,
     MemoryMetadata,
+    MemoryType,
     ProposalStatus,
     QueryResult,
+    UpdateResult,
     WriteResult,
 )
 
@@ -345,7 +350,7 @@ from novaos_client_sdk.pii import mask_pii, mask_pii_in_dict
 from novaos_client_sdk.schema_validation import validate_against_schema
 from novaos_client_sdk.utils import match_capabilities, normalize_capability_name
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = [
     "__version__",
@@ -478,10 +483,12 @@ __all__ = [
     "AgentDiscoveryService",
     "fetch_agent_card",
     # DNS
+    "AgentCatalogClient",
     "AgentDNSClient",
     "AgentDNSRecord",
     "discover_and_connect",
     # Capabilities
+    "CatalogAgent",
     "CapabilityIndex",
     "CapabilityMatcher",
     "MatchResult",
@@ -518,11 +525,14 @@ __all__ = [
     "MemoryClient",
     "MemoryItem",
     "MemoryMetadata",
+    "MemoryType",
     "QueryResult",
     "WriteResult",
     "ProposalStatus",
     "ForgetResult",
+    "UpdateResult",
     "HintResult",
+    "HintStatus",
     "LiveMessage",
     "AssembleResult",
     # Gateway Observability Client (EventIndex / DebugSession)
@@ -539,6 +549,7 @@ __all__ = [
     "HeartbeatConfigStatus",
     # Execution Gateway Client
     "GatewayClient",
+    "Attachment",
     "ExecuteResult",
     "StreamEvent",
     "TERMINAL_RUN_STATUSES",

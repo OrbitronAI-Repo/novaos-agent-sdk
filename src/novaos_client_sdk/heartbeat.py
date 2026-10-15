@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_details, status_error_message
 from novaos_client_sdk._resilience import CircuitBreaker as _CircuitBreaker
 from novaos_client_sdk._resilience import backoff_delay
 from novaos_client_sdk.exceptions import (
@@ -442,10 +443,10 @@ class HeartbeatClient:
                         except ValueError:
                             pass
                 raise NovaOSServerError(
-                    f"agent-ops returned HTTP {e.response.status_code}: {e}",
+                    status_error_message("agent-ops", e),
                     status_code=e.response.status_code,
                     retry_after=retry_after,
-                    details={"original_error": type(e).__name__},
+                    details=status_error_details(e),
                 ) from e
 
             result: dict[str, Any] = response.json()

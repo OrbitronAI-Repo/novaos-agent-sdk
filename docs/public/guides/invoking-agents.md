@@ -79,7 +79,7 @@ card = await fetch_agent_card("http://my-agent.example.internal:8000")
 print(card.name, [s.id for s in card.skills])
 ```
 
-For repeated lookups, [`AgentDiscoveryService`](../reference/api.md#novaos_client_sdk.discovery) keeps a client around and caches the card for `cache_ttl` seconds (default 300); `svc.to_client()` builds a `Client` from the card it already fetched, matching the protocol binding and tenant the card declares.
+For repeated lookups, [`AgentDiscoveryService`](../reference/api.md#novaos_client_sdk.discovery) keeps a client around and caches the card for `cache_ttl` seconds (default 300); `svc.to_client(allowed_host_suffixes=[...])` builds a `Client` from the card it already fetched, matching the protocol binding and tenant the card declares. The card's URL decides where the client connects and where its credentials are sent, so you must name the domains it may point at (`allowed_host_suffixes`).
 
 **"Where is this agent, anywhere on the network?"** — the Agent DNS service answers that, and `discover_and_connect` combines the lookup with client construction in one call:
 

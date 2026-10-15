@@ -261,6 +261,8 @@ class Client:
         tenant: str | None = None,
         interceptors: list[ClientCallInterceptor] | None = None,
         protocol_binding: str = PROTOCOL_BINDING_JSONRPC,
+        guard_connect_ips: bool = False,
+        allow_private_ips: bool = False,
     ) -> None:
         """Initialize the Client.
 
@@ -320,6 +322,17 @@ class Client:
                 :func:`~novaos_client_sdk.a2a_agent_card.select_interface`
                 chose; a ``Client`` built directly from a URL defaults to
                 JSON-RPC, same as always.
+            guard_connect_ips: Resolve the host again at connect time, refuse a
+                private/loopback/link-local/reserved address, and connect to the
+                address that was checked. Closes the gap between
+                :func:`~novaos_client_sdk.dns.validate_agent_url` and the real
+                connection (DNS rebinding). ``False`` (the default) leaves a
+                directly-built client unchanged, so ``localhost`` still works;
+                ``to_client`` helpers turn it on. For gRPC it pins the channel
+                to the checked address unless ``config.grpc_channel_factory``
+                builds the channel, which the SDK cannot pin.
+            allow_private_ips: With ``guard_connect_ips``, skip the range
+                check (a trusted internal registry entry). Ignored otherwise.
 
         Raises:
             ValueError: If two extensions claim the same URI, or one declares
@@ -335,6 +348,8 @@ class Client:
         self._tenant = tenant if tenant is not None else self._tenant_from_card(card, base_url)
         self._interceptors: list[ClientCallInterceptor] = list(interceptors) if interceptors else []
         self._protocol_binding = protocol_binding
+        self._guard_connect_ips = guard_connect_ips
+        self._allow_private_ips = allow_private_ips
 
         # Auth headers are read once, here — unchanged from every version of
         # this client before interceptors existed: a plain `auth=` provider still behaves
@@ -440,7 +455,11 @@ class Client:
             from novaos_client_sdk._a2a_rest import RestTransport
 
             return RestTransport(
-                self._base_url, timeout=self._timeout, headers=self._transport_headers
+                self._base_url,
+                timeout=self._timeout,
+                headers=self._transport_headers,
+                guard_connect_ips=self._guard_connect_ips,
+                allow_private_ips=self._allow_private_ips,
             )
         if self._protocol_binding == PROTOCOL_BINDING_GRPC:
             from novaos_client_sdk._a2a_grpc import GrpcTransport
@@ -453,8 +472,16 @@ class Client:
                 timeout=self._timeout,
                 headers=self._transport_headers,
                 channel_factory=channel_factory,
+                guard_connect_ips=self._guard_connect_ips,
+                allow_private_ips=self._allow_private_ips,
             )
-        return A2ATransport(self._base_url, timeout=self._timeout, headers=self._transport_headers)
+        return A2ATransport(
+            self._base_url,
+            timeout=self._timeout,
+            headers=self._transport_headers,
+            guard_connect_ips=self._guard_connect_ips,
+            allow_private_ips=self._allow_private_ips,
+        )
 
     async def __aenter__(self) -> Client:
         """Async context manager entry."""

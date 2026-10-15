@@ -208,6 +208,22 @@ from .tracing import _HAS_OTEL, _get_tracer
 
 logger = logging.getLogger(__name__)
 
+
+def describe_exception(error: BaseException) -> str:
+    """``"<type>: <message>"`` for a skill failure, or just ``"<type>"`` if it has no message.
+
+    ``str(error)`` alone drops the exception type and is empty for ``TimeoutError()``,
+    so the type is always named. Builtins are bare (``TimeoutError``); anything else is
+    module-qualified so two same-named classes stay distinguishable.
+    """
+    cls = type(error)
+    name = (
+        cls.__qualname__ if cls.__module__ == "builtins" else f"{cls.__module__}.{cls.__qualname__}"
+    )
+    message = str(error)
+    return f"{name}: {message}" if message else name
+
+
 # ⚠️ MUST match message_builder.NOVAOS_METADATA_CONTENT_TYPE (message_builder.py).
 #    temporal-worker's tryExtractNovaosMetadata checks for this exact string —
 #    any variation (e.g. "application/json+novaos.metadata") causes silent skip.
@@ -1380,7 +1396,15 @@ class AgentBuilder:
         three or the flag's promise ("agent output never carries a PII
         pattern") has a hole in it on whichever path forgot.
         """
-        error_message = str(error)
+        error_message = describe_exception(error)
+        logger.error(
+            "skill raised %s; reporting FAILED for task %s",
+            type(error).__qualname__,
+            task_id,
+            # The traceback carries the exception message, which the masking flag
+            # promises never leaves the pod unmasked.
+            exc_info=None if self._mask_output_pii else error,
+        )
         if self._mask_output_pii:
             error_message = mask_pii(error_message) or error_message
         return self._agent_message(

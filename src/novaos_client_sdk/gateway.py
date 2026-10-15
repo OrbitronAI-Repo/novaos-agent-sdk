@@ -84,10 +84,12 @@ Example:
 """
 
 import asyncio
+import base64
 import json
 import logging
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+import re
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Final
 
 from novaos_client_sdk._http import httpx
@@ -296,6 +298,87 @@ class StreamEvent:
         )
 
 
+#: RFC 3986 URI scheme: a letter followed by letters, digits, ``+``, ``-`` or ``.``.
+_URI_SCHEME: Final[re.Pattern[str]] = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """A file attached to an execution request (url or data).
+
+    Mirrors the Execution Gateway's ``Attachment`` schema.  Exactly one of
+    ``url`` or ``data`` must be given; the fields are validated on construction,
+    so an invalid attachment raises before any request is sent.
+
+    Attributes:
+        type: MIME type or logical attachment type.
+        url: Location to fetch the file (an absolute URI).
+        data: Raw file content. Required if no ``url``; mutually exclusive with it.  Base64-encoded by
+            :meth:`to_dict`, so pass the file's bytes (``bytes``, ``bytearray`` or
+            ``memoryview``), not an encoded string.
+            Left out of ``repr`` so a large file does not flood logs.
+        name: Plain filename; no path separators or traversal.
+
+    Raises:
+        NovaOSError: If a field is invalid.
+    """
+
+    type: str
+    url: str | None = None
+    data: bytes | bytearray | memoryview | None = field(default=None, repr=False)
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.type, str) or not self.type:
+            raise NovaOSError("Attachment type must be a non-empty string")
+        # `data` is checked against None, not truthiness: b"" is a valid empty file.
+        if not self.url and self.data is None:
+            raise NovaOSError("Attachment requires either url or data")
+        if self.url and self.data is not None:
+            raise NovaOSError("Attachment accepts only one of url or data, not both")
+        if self.url is not None and not _is_uri(self.url):
+            raise NovaOSError(f"Attachment url is not a valid URI: {self.url!r}")
+        if self.data is not None and not isinstance(self.data, (bytes, bytearray, memoryview)):
+            raise NovaOSError(
+                f"Attachment data must be bytes, bytearray or memoryview, "
+                f"got {type(self.data).__name__}"
+            )
+        if self.name is not None and not _is_plain_filename(self.name):
+            raise NovaOSError(
+                f"Attachment name must be a plain filename without path "
+                f"separators or traversal: {self.name!r}"
+            )
+
+    def to_dict(self) -> dict[str, str]:
+        """Serialize to the request body shape, omitting unset fields.
+
+        ``data`` is sent base64-encoded, as the gateway expects.
+        """
+        body = {"type": self.type}
+        if self.url is not None:
+            body["url"] = self.url
+        if self.data is not None:
+            body["data"] = base64.b64encode(self.data).decode("ascii")
+        if self.name is not None:
+            body["name"] = self.name
+        return body
+
+
+def _is_uri(value: Any) -> bool:
+    """Whether ``value`` is an absolute URI (a scheme followed by a non-empty rest)."""
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        return False
+    scheme, sep, rest = value.partition(":")
+    return bool(sep and rest and _URI_SCHEME.fullmatch(scheme))
+
+
+def _is_plain_filename(value: Any) -> bool:
+    """Whether ``value`` is a bare filename that cannot name another directory."""
+    if not isinstance(value, str) or not value or value in (".", ".."):
+        return False
+    return not any(c in value for c in ("/", "\\", "\0"))
+
+
 @dataclass
 class ExecuteResult:
     """Result of a ``POST /api/v1/execute`` call.
@@ -434,6 +517,7 @@ class GatewayClient:
         *,
         thread_id: str | None = None,
         conversation_id: str | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> ExecuteResult:
         """Start agent execution via the Execution Gateway.
 
@@ -442,6 +526,9 @@ class GatewayClient:
             input_text: Plain-text input for the agent (required, max 100,000 chars).
             thread_id: Optional thread UUID for conversation continuity.
             conversation_id: Optional conversation UUID for grouping runs.
+            attachments: Optional files to send with the request, each given
+                by ``url`` or inline ``data`` bytes.  Omitted from the request
+                when ``None`` or empty.
 
         Returns:
             ExecuteResult with the ``run_id`` for event subscription.
@@ -450,7 +537,8 @@ class GatewayClient:
             NovaOSAuthenticationError: If authentication or authorization fails.
             NovaOSConnectionError: If connection to the gateway fails.
             NovaOSServerError: If the gateway returns a server error.
-            NovaOSError: If instance_id is missing.
+            NovaOSError: If instance_id is missing, or an element of
+                ``attachments`` is not an :class:`Attachment`.
         """
         client = self._ensure_client()
 
@@ -462,6 +550,14 @@ class GatewayClient:
             body["thread_id"] = thread_id
         if conversation_id:
             body["conversation_id"] = conversation_id
+        if attachments:
+            for attachment in attachments:
+                if not isinstance(attachment, Attachment):
+                    raise NovaOSError(
+                        f"attachments must contain Attachment objects, "
+                        f"got {type(attachment).__name__}"
+                    )
+            body["attachments"] = [attachment.to_dict() for attachment in attachments]
 
         try:
             response = await client.post("/api/v1/execute", json=body)
