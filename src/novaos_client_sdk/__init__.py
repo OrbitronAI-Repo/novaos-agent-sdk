@@ -233,6 +233,7 @@ from novaos_client_sdk.exceptions import (
     NovaOSDNSError,
     NovaOSDNSRateLimitError,
     NovaOSError,
+    NovaOSQuotaExceededError,
     NovaOSRateLimitError,
     NovaOSServerError,
     NovaOSValidationError,
@@ -279,6 +280,7 @@ from novaos_client_sdk.memory import (
     MemoryType,
     ProposalStatus,
     QueryResult,
+    QuotaStatus,
     UpdateResult,
     WriteResult,
 )
@@ -350,7 +352,7 @@ from novaos_client_sdk.pii import mask_pii, mask_pii_in_dict
 from novaos_client_sdk.schema_validation import validate_against_schema
 from novaos_client_sdk.utils import match_capabilities, normalize_capability_name
 
-__version__ = "2.1.0"
+__version__ = "2.3.0"
 
 __all__ = [
     "__version__",
@@ -523,6 +525,7 @@ __all__ = [
     "MCPToolResult",
     # Memory Service Client
     "MemoryClient",
+    "QuotaStatus",
     "MemoryItem",
     "MemoryMetadata",
     "MemoryType",
@@ -568,6 +571,7 @@ __all__ = [
     "NovaOSRateLimitError",
     "NovaOSValidationError",
     "NovaOSAgentNotFoundError",
+    "NovaOSQuotaExceededError",
     "NovaOSServerError",
     "NovaOSDNSError",
     "NovaOSDNSConnectionError",

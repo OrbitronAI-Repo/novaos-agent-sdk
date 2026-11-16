@@ -96,6 +96,7 @@ class TaskUpdater:
         self._lock = asyncio.Lock()
         self._terminal_reached = False
         self._revoked = False
+        self._last_written_state: TaskState | None = None
 
     def revoke(self) -> None:
         """Turn every later write through this updater into a silent no-op.
@@ -152,6 +153,19 @@ class TaskUpdater:
         concretely) is handled instead.
         """
         return self._terminal_reached or self._revoked
+
+    @property
+    def last_written_state(self) -> TaskState | None:
+        """The state the most recent status write through *this* instance set.
+
+        ``None`` until one lands. A write skipped by the store's terminal guard
+        or by :meth:`revoke` does not count. Like :attr:`is_sealed`, this only
+        reflects this instance, not the store — which is exactly what
+        :meth:`~novaos_client_sdk.agent_builder.AgentBuilder._finalize_task`
+        needs to tell a pause the running skill published itself apart from
+        one left over from an earlier execution of the same task.
+        """
+        return self._last_written_state
 
     async def _current_task(self) -> Task:
         """The task this updater owns, creating a bare skeleton if none is stored yet.
@@ -260,6 +274,7 @@ class TaskUpdater:
 
         task.status = TaskStatus(state=state, message=message, timestamp=utc_timestamp())
         await self._store.save(task)
+        self._last_written_state = state
         await self.event_queue.enqueue_event(
             TaskStatusUpdateEvent(
                 status=task.status, task_id=self.task_id, context_id=self.context_id

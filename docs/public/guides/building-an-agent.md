@@ -20,7 +20,20 @@ app.post(A2A_JSONRPC_PATH)(agent.asgi_endpoint())
 
 ## Skills
 
-`@agent.skill(name, description, *, id=None, tags=None, input_modes=None, output_modes=None)` registers a handler. `id` defaults to `name` and is the routing key a caller sends to pick this skill; `tags`/`input_modes`/`output_modes` populate the corresponding fields on the published `AgentSkill`.
+`@agent.skill(name, description, *, id=None, tags=None, input_modes=None, output_modes=None, examples=None)` registers a handler. `id` defaults to `name` and is the routing key a caller sends to pick this skill; `tags`/`input_modes`/`output_modes`/`examples` populate the corresponding fields on the published `AgentSkill`.
+
+**Give every skill `examples=`.** They reach the served Agent Card, and the card is where a caller reads what input a skill expects. Write each one as the exact text a caller would send:
+
+```python
+@agent.skill(
+    "summarise",
+    description="Summarise a support ticket",
+    examples=["Summarise ticket 1234", "Summarise the last three replies on ticket 1234"],
+)
+async def summarise(ctx: AgentExecutionContext, input_text: str) -> SkillResult: ...
+```
+
+`examples=` is newer than SDK 2.3.0rc6. SDK 2.3.0rc6 and earlier raise `TypeError: AgentBuilder.skill() got an unexpected keyword argument 'examples'`. Your agent's image installs the SDK pinned in its own requirements (`requirements-sdk.txt` in a `novaos-cli init` project), not the one on your machine, so check that pin before adding `examples=`. If the image's SDK is older, leave `examples=` out, or the container fails at startup even though local tests pass.
 
 An agent with a single skill routes every request to it automatically. A **multi-skill** agent requires the caller to name one — via the message's `skillId` metadata, or `config.skill` in the platform context — otherwise the request is rejected outright (`TASK_STATE_REJECTED`) rather than guessed at.
 
@@ -69,6 +82,31 @@ async def connect_gmail(ctx: AgentExecutionContext, input_text: str) -> SkillRes
     return SkillResult(output="Connect your Gmail account to continue.", status="AUTH_REQUIRED")
 ```
 
+The message you publish is the one the task pauses with: when the returned status matches the pause you already published (`WAITING_USER` after `requires_input`, `AUTH_REQUIRED` after `requires_auth`), the SDK keeps your message rather than replacing it with one built from `output`. That matters because the platform reads the HITL payload from the paused task's last status message. In particular, to pause a gated write for approval, put the tool's fully qualified name in the HITL metadata as `pending_tool` — the approval is bound to that tool, and a pause without it can never be approved:
+
+```python
+from novaos_client_sdk.messages import HITLMessageType
+
+@agent.skill("save-note")
+async def save_note(ctx: AgentExecutionContext, input_text: str) -> SkillResult:
+    resp = await ctx.tools.connectors.call("notes", "create-note", {"title": input_text})
+    if not resp.success and "approval required" in (resp.error or "").lower():
+        message = MessageBuilder.create_hitl_message(
+            content="Approve saving the note?",
+            hitl_type=HITLMessageType.PLAN_CONFIRMATION,
+            metadata={"pending_tool": "novaos.connector.notes.create-note"},
+            actions=[
+                {"id": "approve", "label": "Approve", "type": "button"},
+                {"id": "reject", "label": "Reject", "type": "button"},
+            ],
+        )
+        await ctx.task_updater.requires_input(message)
+        return SkillResult(output="Approve saving the note?", status="WAITING_USER")
+    ...
+```
+
+This works the same for `SendMessage` and `SendStreamingMessage`. Returning a pause status *without* publishing a message first still pauses the task, but with a plain-text message built from `output` and no HITL payload. `output` still becomes the task's output artifact either way.
+
 For a write-confirmation pause, always pass the tool call's real `call_id` — the platform binds the resume token to it, so a placeholder turns a scoped confirmation into a run failure rather than a blanket write authorization.
 
 **Resuming a paused task.** A2A v1.0 defines no dedicated resume RPC: the caller sends a follow-up `SendMessage` carrying the same `task_id`, which your agent receives as a normal request. See [Invoking agents](invoking-agents.md) for the calling side.
@@ -80,7 +118,7 @@ Every skill receives an [`AgentExecutionContext`](../reference/api.md#novaos_cli
 - `ctx.tools` — governed access to platform services; see [Platform tools](platform-tools.md).
 - `ctx.config` — agent-level configuration passed by the caller.
 - `ctx.history` — earlier turns of the conversation, oldest first, as `ConversationTurn(role, content)`; empty for a single-shot invocation.
-- `ctx.get_secret(name, default=...)` — opens a sealed secret delivered with this request; raises if undeclared and no default is given.
+- `ctx.get_secret(name, default=...)` — opens a sealed secret delivered with this request, or reads the environment variable of that name when none was; raises if neither exists and no default is given.
 - `ctx.idempotency_key` — stable across retries of one logical execution; agent execution is **at-least-once**, so a skill with non-idempotent side effects should dedupe on this key, never on `ctx.run_id`.
 - `ctx.is_cancelled` / `ctx.raise_if_cancelled()` — check inside synchronous work between awaits; an `await` is already interrupted automatically once `CancelTask` arrives.
 - `ctx.logger` — see [Logging](#logging) below.
@@ -95,10 +133,23 @@ Agent pods are never internet-reachable, so a pod never serves its own Agent Car
 
 ## Logging
 
-`ctx.logger` is a structured JSON logger pre-bound to this execution's `run_id`, `agent_id`, and `tenant_id` — every line is filterable by run without threading those fields through by hand:
+`ctx.logger` is a structured JSON logger pre-bound to this execution's `run_id`, `agent_id`, `tenant_id`, `instance_id` and `trace_id` — every line is filterable by run, and joins to the run's trace, without threading those fields through by hand:
 
 ```python
 ctx.logger.info("Processing request", extra={"input_length": len(input_text)})
 ```
 
-Outside a request handler (startup code, background tasks), call `get_agent_logger` directly with the same fields. Both write newline-delimited JSON to stdout.
+Outside a request handler (startup code, background tasks), call `get_agent_logger` directly with the same fields. Both write newline-delimited JSON to stdout. Each line also carries the `span_id` of the span active when it was written, so a line links to one span of the run's trace.
+
+While a skill runs, lines from any other logger (the SDK's own modules, `httpx`, any library) carry the run's ids too. When the agent runs its first skill, the SDK gives the root logger a JSON stdout handler that adds `run_id`, `trace_id`, `span_id`, `agent_id`, `tenant_id` and `instance_id` to every record (and `logger`, the logger's name), so `agent logs --run-id` shows those lines as well. The root logger's level is left as it is (`WARNING` by default). It is not installed when:
+
+- your application configured the root logger itself (for example with `logging.basicConfig`). Add `novaos_client_sdk.logging.RunContextFilter()` to your own handler to get the same fields;
+- `NOVAOS_STRUCTURED_ROOT_LOGS=false` is set.
+
+When a skill raises, its traceback is logged through `ctx.logger` as one JSON line with the run's ids and `exc_info` (PII masked).
+
+`print()` output is plain text with no run id, so it does not appear under a run filter: use `ctx.logger` instead.
+
+## Tracing
+
+Each skill runs as a `skill.<name>` span, on `SendMessage` and `SendStreamingMessage` alike, as a child of the caller's `traceparent`. It is `ERROR` when the skill raises or returns `FAILED`, and spans are exported before the response ends. Spans the skill starts nest under it: `LLMClient` calls (`llm.*`), `ctx.tools` calls (`tool.*`, with the MCP Gateway's own spans as their children), `MCPClient` calls (`mcp.*`) and `AgentLoop` nodes. Pass `execution_context=ctx` to an `MCPClient` you build yourself so that it also joins the run's trace outside the skill's span.

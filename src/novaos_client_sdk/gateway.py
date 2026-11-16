@@ -32,23 +32,22 @@ hops below this client, and swapping it changes nothing on this wire.
 
 The one thing the migration *does* reach is the payload of the ``hitl`` event:
 the platform's human-in-the-loop pause is now backed by A2A's first-class
-``TASK_STATE_INPUT_REQUIRED`` rather than ACP's custom ``await_request`` field
-(ADR F4).  This client passes that payload through opaquely, so it is unaffected
-either way.
+``TASK_STATE_INPUT_REQUIRED`` rather than ACP's custom ``await_request`` field.
+This client passes that payload through opaquely, so it is unaffected either
+way.
 
-Terminal events and KB-15
--------------------------
+Terminal events
+---------------
 
 The one place the assessment did find a defect was terminal-event handling, and
 it is the same bug class the migration exists to avoid repeating.
-``docs/knowledge-base/kb-15-marketplace-execution-stuck-acp-failed.md`` describes
-a run that failed while the UI waited forever, because the failure arrived in a
-shape the consumer did not recognize as an ending.  :meth:`GatewayClient.events`
-had exactly that shape: it stopped only on ``done`` and ``error``, so a run whose
-terminal signal arrives as ``status`` with a terminal ``payload.status`` — which
-is how the platform records a failure to the event log, and therefore how every
-replayed run reports its ending — neither ended the iteration nor surfaced the
-failure.
+A known failure of this kind is a run that failed while the UI waited
+forever, because the failure arrived in a shape the consumer did not recognize
+as an ending.  :meth:`GatewayClient.events` had exactly that shape: it stopped
+only on ``done`` and ``error``, so a run whose terminal signal arrives as
+``status`` with a terminal ``payload.status`` — which is how the platform
+records a failure to the event log, and therefore how every replayed run
+reports its ending — neither ended the iteration nor surfaced the failure.
 
 :attr:`StreamEvent.is_terminal` and :attr:`StreamEvent.is_failure` are now the
 contract, and :meth:`GatewayClient.events` stops on the former.  Consumers should
@@ -93,12 +92,14 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_retry_after
 from novaos_client_sdk._resilience import backoff_delay
 from novaos_client_sdk.auth import AuthProvider
 from novaos_client_sdk.exceptions import (
     NovaOSAuthenticationError,
     NovaOSConnectionError,
     NovaOSError,
+    NovaOSRateLimitError,
     NovaOSServerError,
 )
 
@@ -183,7 +184,7 @@ class StreamEvent:
         aborts one, and a ``status`` event carrying a terminal run status is how
         the *event log* records an ending — which is what a client replaying a
         finished run sees, and what a failure detected after the agent already
-        returned looks like.  Recognizing only the first two is the KB-15 defect
+        returned looks like.  Recognizing only the first two is that defect
         (see the module docstring).
 
         Two things this deliberately does not do.  It does not treat
@@ -201,7 +202,7 @@ class StreamEvent:
     def is_failure(self) -> bool:
         """Whether this event reports that the run did **not** succeed.
 
-        The KB-15 invariant a consumer needs: a terminal non-success state must
+        The invariant a consumer needs: a terminal non-success state must
         never be mistaken for success.  A stream can end in failure without ever
         producing an ``error`` event — the platform records a late-detected
         failure as ``status``/``FAILED`` — so a consumer that watches only for
@@ -482,6 +483,12 @@ class GatewayClient:
                     f"Gateway authorization failed: {error_str}",
                     details={"status_code": status_code, "original_error": error_type},
                 )
+            if status_code == 429:
+                return NovaOSRateLimitError(
+                    f"Gateway rate limit exceeded: {error_str}",
+                    retry_after=status_error_retry_after(error),
+                    details={"status_code": status_code, "original_error": error_type},
+                )
             if status_code in (500, 502, 503, 504):
                 return NovaOSServerError(
                     f"Gateway server error: {error_str}",
@@ -517,6 +524,7 @@ class GatewayClient:
         *,
         thread_id: str | None = None,
         conversation_id: str | None = None,
+        skill: str | None = None,
         attachments: Sequence[Attachment] | None = None,
     ) -> ExecuteResult:
         """Start agent execution via the Execution Gateway.
@@ -526,6 +534,9 @@ class GatewayClient:
             input_text: Plain-text input for the agent (required, max 100,000 chars).
             thread_id: Optional thread UUID for conversation continuity.
             conversation_id: Optional conversation UUID for grouping runs.
+            skill: Optional id of the agent skill to run. Needed when the agent
+                has more than one skill; omit for a single-skill agent. Omitted
+                from the request when ``None`` or empty.
             attachments: Optional files to send with the request, each given
                 by ``url`` or inline ``data`` bytes.  Omitted from the request
                 when ``None`` or empty.
@@ -536,6 +547,7 @@ class GatewayClient:
         Raises:
             NovaOSAuthenticationError: If authentication or authorization fails.
             NovaOSConnectionError: If connection to the gateway fails.
+            NovaOSRateLimitError: If the gateway rate-limits the request (HTTP 429).
             NovaOSServerError: If the gateway returns a server error.
             NovaOSError: If instance_id is missing, or an element of
                 ``attachments`` is not an :class:`Attachment`.
@@ -550,6 +562,8 @@ class GatewayClient:
             body["thread_id"] = thread_id
         if conversation_id:
             body["conversation_id"] = conversation_id
+        if skill:
+            body["skill"] = skill
         if attachments:
             for attachment in attachments:
                 if not isinstance(attachment, Attachment):
@@ -581,7 +595,7 @@ class GatewayClient:
         caller sees how the run ended.  Check :attr:`StreamEvent.is_failure` on
         it: a run can end in failure without ever producing an ``error`` event,
         and treating "the loop finished" as "the run succeeded" is precisely the
-        KB-15 defect this module's docstring describes.
+        defect this module's docstring describes.
 
         Reconnecting after a disconnect: pass the ``id`` of the last
         :class:`StreamEvent` this method yielded as
@@ -605,6 +619,7 @@ class GatewayClient:
         Raises:
             NovaOSAuthenticationError: If authentication fails.
             NovaOSConnectionError: If connection to the gateway fails.
+            NovaOSRateLimitError: If the gateway rate-limits the request (HTTP 429).
             NovaOSServerError: If the gateway returns a server error.
         """
         client = self._ensure_client()
@@ -664,7 +679,7 @@ class GatewayClient:
         and no duplicate.
 
         Only retryable failures (:attr:`NovaOSError.is_retryable`, e.g. a
-        dropped connection or a 502/503/504) trigger a reconnect; an
+        dropped connection, a 429 or a 502/503/504) trigger a reconnect; an
         authentication failure or another non-retryable error propagates
         immediately. Reconnect attempts use :func:`_resilience.backoff_delay`
         (exponential backoff from ``initial_backoff`` seconds up to

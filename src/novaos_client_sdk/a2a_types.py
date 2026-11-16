@@ -56,7 +56,7 @@ instead means a vendor client library, if one is ever adopted, is an
 implementation detail behind
 ``client.py``, not a type that leaks through the SDK's public message API.
 
-**Wire format (corrected by F18).**  A2A v1.0 defines its data structures in
+**Wire format.**  A2A v1.0 defines its data structures in
 `specification/a2a.proto`, and every JSON binding — JSON-RPC included — carries
 the **proto3 JSON mapping** of those messages: ``lowerCamelCase`` field names,
 enums as their full value names, and a ``oneof`` rendered as whichever member is
@@ -85,7 +85,7 @@ agent answers ``VersionNotSupportedError``.  ``A2A_VERSION_HEADER`` and
 so that a NovaOS pod and a vendor-SDK pod answer an identical request
 identically.
 
-Spec mapping notes (ADR F2):
+Spec mapping notes:
 
 - ACP ``MessagePart(content=..., content_type=...)`` has no single A2A
   equivalent.  A2A splits parts by *content*: ``text`` for human-readable text,
@@ -98,7 +98,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Final
 from uuid import uuid4
 
-# The A2A specification release these types are written against.  Pinned per F17;
+# The A2A specification release these types are written against.  Pinned on purpose;
 # bumping it is a deliberate follow-up decision, not implicit drift from "latest".
 A2A_SPEC_VERSION: Final = "1.0.1"
 
@@ -602,7 +602,7 @@ def is_a2a_shaped(message: Any) -> bool:
 
     v0.3 put a ``kind: "message"`` discriminator on the wire and NovaOS used it
     to tell A2A messages apart from ACP ones.  v1.0's ``Message`` has no such
-    field (F18), so the test is structural: an :class:`A2AMessage`, or anything
+    field, so the test is structural: an :class:`A2AMessage`, or anything
     carrying the envelope the spec makes REQUIRED — ``messageId``, ``role`` and
     ``parts``.
 

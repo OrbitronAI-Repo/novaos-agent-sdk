@@ -45,8 +45,10 @@ from typing import TYPE_CHECKING, Any
 
 from novaos_client_sdk.context import ExecutionContext
 from novaos_client_sdk.exceptions import NovaOSError
+from novaos_client_sdk.tracing import _HAS_OTEL, start_outbound_span
 
 if TYPE_CHECKING:
+    import httpx
     from openai import AsyncOpenAI
     from openai.resources.chat import AsyncChat
     from openai.resources.embeddings import AsyncEmbeddings
@@ -55,6 +57,80 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 LLM_GATEWAY_URL_ENV = "LLM_GATEWAY_URL"
+
+
+_LLM_SPAN_KEY = "novaos.llm_span"
+
+
+def _llm_span_name(url_path: str) -> str:
+    """``/v1/chat/completions`` -> ``llm.chat.completions``."""
+    path = url_path.strip("/")
+    if path.startswith("v1/"):
+        path = path[len("v1/") :]
+    return "llm." + (path.replace("/", ".") or "request")
+
+
+def _end_span_when_closed(response: httpx.Response, span: Any) -> None:
+    """End ``span`` once ``response`` is closed, i.e. its body has been fully read.
+
+    A streamed chat completion is read long after the response headers arrive, so
+    ending the span with the headers would report only the time to first byte.
+    Wrapping the response's ``aclose`` rather than its stream keeps this
+    independent of which httpx flavour the installed ``openai`` builds on.
+    """
+    close = response.aclose
+    ended = False
+
+    async def aclose() -> None:
+        nonlocal ended
+        try:
+            await close()
+        finally:
+            if not ended:
+                ended = True
+                span.end()
+
+    response.aclose = aclose  # type: ignore[method-assign]
+
+
+def _tracing_event_hooks(fallback_traceparent: str) -> dict[str, list[Any]]:
+    """httpx event hooks that make each gateway call a client span in the run's trace.
+
+    The request hook starts ``llm.<path>`` as a child of the active span (the
+    skill's) and sends that span's ``traceparent``, so the gateway's own spans nest
+    under it; the response hook ends it when the body is closed. Hooks, not a
+    custom transport, so proxy environment variables keep applying. An
+    unreachable gateway raises before any response, so that call's span is never
+    ended and is therefore never exported.
+    """
+
+    async def on_request(request: httpx.Request) -> None:
+        started = start_outbound_span(
+            _llm_span_name(request.url.path),
+            attributes={
+                "http.request.method": request.method,
+                "server.address": request.url.host,
+            },
+            fallback_traceparent=fallback_traceparent,
+        )
+        if started is None:
+            return
+        span, carrier = started
+        request.extensions[_LLM_SPAN_KEY] = span
+        request.headers.update(carrier)
+
+    async def on_response(response: httpx.Response) -> None:
+        span = response.request.extensions.get(_LLM_SPAN_KEY)
+        if span is None:
+            return
+        span.set_attribute("http.response.status_code", response.status_code)
+        if response.status_code >= 400:
+            from opentelemetry.trace import StatusCode
+
+            span.set_status(StatusCode.ERROR, f"HTTP {response.status_code}")
+        _end_span_when_closed(response, span)
+
+    return {"request": [on_request], "response": [on_response]}
 
 
 class LLMClient:
@@ -115,12 +191,33 @@ class LLMClient:
             api_key = execution_context.require_token()
             default_headers = execution_context.to_context_headers()
 
+        # The run's trace, so the gateway's spans join it. A context that carries
+        # the inbound `traceparent` (`AgentExecutionContext`) supplies it; the plain
+        # `ExecutionContext` has none.
+        traceparent = str(getattr(execution_context, "traceparent", "") or "")
+        if traceparent:
+            default_headers["traceparent"] = traceparent
+
+        client_kwargs: dict[str, Any] = {}
+        if _HAS_OTEL:
+            try:
+                from openai import DefaultAsyncHttpxClient
+
+                client_kwargs["http_client"] = DefaultAsyncHttpxClient(
+                    event_hooks=_tracing_event_hooks(traceparent)
+                )
+            except ImportError:
+                # An older `openai` without the default client class: the static
+                # `traceparent` header above still carries the run's trace.
+                pass
+
         self._client: AsyncOpenAI = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout,
             max_retries=0,
             default_headers=default_headers,
+            **client_kwargs,
         )
 
     # Expose openai.AsyncOpenAI sub-clients directly

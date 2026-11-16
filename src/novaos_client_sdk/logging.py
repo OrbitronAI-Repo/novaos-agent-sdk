@@ -26,6 +26,15 @@ Standalone usage (outside an A2A handler):
     from novaos_client_sdk import get_agent_logger
     logger = get_agent_logger(run_id="run-abc", agent_id="agent-xyz", tenant_id="t-1")
     logger.info("Processing started")
+
+Every line also carries ``span_id`` (and ``trace_id``, if not bound) of the span
+active when it was written, so a line links to one span of the run's trace.
+
+Lines from any other logger (the SDK's own modules, third-party libraries) carry
+the run's ids too while a skill runs: when an agent runs its first skill,
+:func:`install_structured_root_logging` gives the root logger a JSON stdout
+handler with :class:`RunContextFilter`, unless the application configured the
+root logger itself or ``NOVAOS_STRUCTURED_ROOT_LOGS=false`` is set.
 """
 
 from __future__ import annotations
@@ -33,12 +42,15 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TextIO
 
 from .pii import mask_pii, mask_pii_in_dict
+from .run_context import current_run
+from .tracing import current_span_ids
 
 # Names that collide with a stdlib LogRecord's own attributes (plus "asctime",
 # which logging.Formatter computes lazily). Passing any of these inside `extra=`
@@ -82,6 +94,13 @@ _LOGGER_METHOD_KWARGS = frozenset({"exc_info", "extra", "stack_info", "stackleve
 
 # Methods wrapped by _make_structlog_tolerant() below.
 _LOGGER_METHODS_TO_WRAP = ("debug", "info", "warning", "error", "critical", "exception")
+
+# The run's ids RunContextFilter stamps onto a record, in the order they are written.
+_RUN_LOG_FIELDS = ("run_id", "agent_id", "tenant_id", "trace_id", "instance_id")
+
+# Set to false/0/no/off to keep the root logger as the application left it.
+STRUCTURED_ROOT_LOGS_ENV = "NOVAOS_STRUCTURED_ROOT_LOGS"
+_root_logging_installed = False
 
 
 def _make_structlog_tolerant(bound_method: Callable[..., None]) -> Callable[..., None]:
@@ -129,7 +148,7 @@ def _make_structlog_tolerant(bound_method: Callable[..., None]) -> Callable[...,
 class _NovaOSJsonFormatter(logging.Formatter):
     """Formats log records as single-line JSON objects.
 
-    Injects context fields (run_id, agent_id, tenant_id) from a fixed mapping
+    Injects context fields (run_id, agent_id, tenant_id, trace_id, instance_id) from a fixed mapping
     bound at logger-creation time, then merges any extra fields the caller
     passes via ``extra={}``.
     """
@@ -142,10 +161,13 @@ class _NovaOSJsonFormatter(logging.Formatter):
     # since that one CAN collide when passed through extra=.
     _RESERVED = _RESERVED_LOG_RECORD_ATTRS - {"asctime"}
 
-    def __init__(self, context_fields: dict[str, str]) -> None:
+    def __init__(
+        self, context_fields: dict[str, str], *, include_logger_name: bool = False
+    ) -> None:
         super().__init__()
         # Only include non-empty context values to keep lines clean.
         self._ctx: dict[str, str] = {k: v for k, v in context_fields.items() if v}
+        self._include_logger_name = include_logger_name
 
     def format(self, record: logging.LogRecord) -> str:
         record.message = record.getMessage()
@@ -160,8 +182,22 @@ class _NovaOSJsonFormatter(logging.Formatter):
             "message": masked_message,
         }
 
-        # Inject run_id / agent_id / tenant_id from the bound context.
+        if self._include_logger_name:
+            payload["logger"] = record.name
+
+        # Inject run_id / agent_id / tenant_id / trace_id / instance_id from the bound context.
         payload.update(self._ctx)
+        # Then the run's ids RunContextFilter stamped on the record (lines from
+        # loggers not bound to a run), and the active span, so the line links to
+        # the span it was written in.
+        for field in (*_RUN_LOG_FIELDS, "span_id"):
+            value = getattr(record, field, "")
+            if value and field not in payload:
+                payload[field] = value
+        trace_id, span_id = current_span_ids()
+        if span_id:
+            payload.setdefault("trace_id", trace_id)
+            payload.setdefault("span_id", span_id)
 
         # Merge caller-supplied extra fields (skip internal logging attrs).
         extra_fields: dict[str, Any] = {}
@@ -189,13 +225,16 @@ def get_agent_logger(
     run_id: str = "",
     agent_id: str = "",
     tenant_id: str = "",
+    trace_id: str = "",
+    instance_id: str = "",
     name: str = "novaos.agent",
 ) -> logging.Logger:
     """Return a structured JSON logger bound to the given execution context fields.
 
     The logger writes newline-delimited JSON to stdout.  Each line includes
-    ``run_id``, ``agent_id``, and ``tenant_id`` (when non-empty) so that Loki
-    can correlate entries across the execution namespace.
+    ``run_id``, ``agent_id``, ``tenant_id``, ``trace_id`` and ``instance_id`` (each
+    when non-empty) so that Loki can correlate entries across the execution
+    namespace and join them to the run's trace.
 
     The returned ``logging.Logger`` is a standard Python logger — all normal
     logging methods (``info``, ``warning``, ``error``, ``debug``, ``exception``)
@@ -211,6 +250,8 @@ def get_agent_logger(
         run_id: Execution run ID (from ``ctx.run_id``).
         agent_id: Agent ID (from ``ctx.agent_id``).
         tenant_id: Tenant ID (from ``ctx.tenant_id``).
+        trace_id: W3C trace id of the run (from ``ctx.trace_id``).
+        instance_id: Agent instance ID (from ``ctx.instance_id``).
         name: Logger name (useful when multiple agents share a process).
 
     Returns:
@@ -234,6 +275,8 @@ def get_agent_logger(
             "run_id": run_id,
             "agent_id": agent_id,
             "tenant_id": tenant_id,
+            "trace_id": trace_id,
+            "instance_id": instance_id,
         }
     )
 
@@ -260,3 +303,93 @@ def get_agent_logger(
             handler.setFormatter(new_formatter)
 
     return logger
+
+
+# ---------------------------------------------------------------------------
+# Run identity on every logger
+# ---------------------------------------------------------------------------
+
+
+class RunContextFilter(logging.Filter):
+    """Stamp the current run's ids and the active span's id onto every record.
+
+    While a skill runs, ``run_id``, ``agent_id``, ``tenant_id``, ``trace_id`` and
+    ``instance_id`` come from the run :class:`~novaos_client_sdk.agent_builder.AgentBuilder`
+    bound for it (see :mod:`novaos_client_sdk.run_context`); ``span_id`` is the
+    active OpenTelemetry span's, whenever one is active. A field the caller
+    already set (``extra=``) is left alone. Outside a run only ``span_id`` (and
+    the span's ``trace_id``) is added.
+
+    The SDK attaches it to the root handler it installs
+    (:func:`install_structured_root_logging`). An application that configures
+    logging itself can add it to its own handlers to get the same fields::
+
+        handler.addFilter(RunContextFilter())
+
+    Never rejects a record.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        run = current_run()
+        fields: dict[str, str] = {}
+        if run is not None:
+            fields = {field: getattr(run, field) for field in _RUN_LOG_FIELDS}
+        trace_id, span_id = current_span_ids()
+        if span_id:
+            fields["span_id"] = span_id
+            fields["trace_id"] = fields.get("trace_id") or trace_id
+        for field, value in fields.items():
+            if value and not getattr(record, field, ""):
+                setattr(record, field, value)
+        return True
+
+
+class _StdoutHandler(logging.StreamHandler):
+    """A stream handler that writes to whatever ``sys.stdout`` is at the time of each line."""
+
+    def __init__(self) -> None:
+        super().__init__(sys.stdout)
+
+    @property
+    def stream(self) -> TextIO:
+        return sys.stdout
+
+    @stream.setter
+    def stream(self, value: TextIO) -> None:
+        pass
+
+
+def install_structured_root_logging() -> bool:
+    """Give the root logger a JSON stdout handler that stamps the run's ids, once per process.
+
+    Lines from the SDK's own module loggers and from third-party libraries then
+    reach stdout as JSON with ``run_id``, ``trace_id``, ``span_id`` and the
+    other run fields while a skill runs, so ``agent logs --run-id`` shows them
+    too. ``ctx.logger`` and :func:`get_agent_logger` loggers do not propagate to
+    the root logger, so their lines are not written twice. The root logger's
+    level is not changed (``WARNING`` unless the application set another).
+
+    :class:`~novaos_client_sdk.agent_builder.AgentBuilder` calls this when it
+    runs its first skill, not on import. It does nothing when the root logger
+    already has a handler (the application configured logging itself; add
+    :class:`RunContextFilter` to that handler instead), when
+    ``NOVAOS_STRUCTURED_ROOT_LOGS`` is ``false``/``0``/``no``/``off``, or on any
+    call after the first.
+
+    Returns:
+        ``True`` when this call added the handler.
+    """
+    global _root_logging_installed
+    if _root_logging_installed:
+        return False
+    _root_logging_installed = True
+    if os.environ.get(STRUCTURED_ROOT_LOGS_ENV, "").strip().lower() in {"false", "0", "no", "off"}:
+        return False
+    root = logging.getLogger()
+    if root.handlers:
+        return False
+    handler = _StdoutHandler()
+    handler.setFormatter(_NovaOSJsonFormatter({}, include_logger_name=True))
+    handler.addFilter(RunContextFilter())
+    root.addHandler(handler)
+    return True

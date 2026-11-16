@@ -14,7 +14,7 @@ touches the store (see :class:`~novaos_client_sdk.agent_builder.AgentBuilder`'s
 acceptance criterion that its response is byte-identical either way); what
 changes is that the task now also has somewhere to be looked up afterward.
 
-**Scope, per the ADR this ticket implements (F9/F15).** NovaOS pods are not
+**Scope.** NovaOS pods are not
 internet-reachable and the Temporal worker drives execution; the gateway owns
 the authoritative run record the Agent Log Panel and the Loki pipeline key on.
 So an **in-process** store is the right default — a pod's lifetime is one
@@ -94,7 +94,7 @@ class InMemoryTaskStore(TaskStore):
     """A :class:`TaskStore` backed by a dict in this process's memory.
 
     The default for :class:`~novaos_client_sdk.agent_builder.AgentBuilder`, and
-    per the ADR (F9/F15) the *only* store this SDK ships: a pod is not
+    the *only* store this SDK ships: a pod is not
     internet-reachable and the gateway already owns the durable run record, so
     there is nothing for a second, cross-pod-durable implementation to do here
     that would not compete with that record.

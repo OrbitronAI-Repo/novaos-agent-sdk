@@ -36,7 +36,7 @@ NovaOSError (base)
     └── VersionNotSupportedError                   (-32009)
 ```
 
-This is the 2.x renamed successor of an older `ACP*`-prefixed hierarchy with the same shape but no A2A subtree — see [Migrating from 1.x](migrating-from-1x.md) if you're porting `except ACP...` handlers.
+This is the 2.x renamed successor of the `1.x` exception hierarchy, which had the same shape but no A2A subtree — see [Migrating from 1.x](migrating-from-1x.md) if you're porting `1.x` exception handlers.
 
 Every instance carries `message`, `retry_after: float | None`, and `details: dict`, plus `is_retryable: bool` (`True` for connection errors, rate limits, and server errors with a retryable status code). Subclass extras — `field`/`reason`, `status_code`, `agent_name`, `error_code`/`task_id` — are **keyword-only**, so `NovaOSValidationError("m", 1.5)` can't be mistaken for a positional `retry_after` the way an older `ACPValidationError` accepted.
 
@@ -132,7 +132,7 @@ if not result.success:
 
 ## Streaming errors
 
-`send_streaming_message` yields A2A `StreamResponse` frames, not a dedicated error-frame type. A protocol failure (an unsupported operation, a card that overclaims streaming support) raises `A2AProtocolError` out of the iterator instead of being yielded; a well-formed stream that never reaches a terminal or interrupt state is itself a transport failure — check with `is_last_frame`, since A2A dropped ACP's `final` flag:
+`send_streaming_message` yields A2A `StreamResponse` frames, not a dedicated error-frame type. A protocol failure (an unsupported operation, a card that overclaims streaming support) raises `A2AProtocolError` out of the iterator instead of being yielded; a well-formed stream that never reaches a terminal or interrupt state is itself a transport failure — check with `is_last_frame`, since A2A has no `final` flag as 1.x did:
 
 ```python
 from novaos_client_sdk import A2AProtocolError, is_last_frame

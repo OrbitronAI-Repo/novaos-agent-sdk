@@ -45,7 +45,7 @@ class AuthInterceptor(ClientCallInterceptor):
     3. Otherwise (no ``CredentialService`` configured, no card to read a
        scheme from, or the service returned nothing), fall back to the
        constructor's synchronous ``AuthProvider`` — exactly what
-       :class:`~novaos_client_sdk.client.Client` did before this ticket, so a
+       :class:`~novaos_client_sdk.client.Client` did before this change, so a
        caller who supplies only ``auth=`` and no ``CredentialService`` sees no
        change at all.
 

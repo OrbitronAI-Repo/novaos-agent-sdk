@@ -79,7 +79,7 @@ def baml_llm_options(
     except ImportError as err:
         raise ImportError(
             "The 'baml-py' package is required for BAML helpers. "
-            "Install it with: pip install baml-py"
+            'Install it with: pip install "novaos-agent-sdk[baml]"'
         ) from err
 
     gateway_url = os.environ.get("LLM_GATEWAY_URL", "")

@@ -7,7 +7,7 @@ the task's status changes.  The gateway already serves the four JSON-RPC
 methods this module's types travel over; this is the client half that was
 missing.
 
-**Flat, not nested — heed F20.**  The ADR's own description of
+**Flat, not nested.**  An earlier description of
 ``TaskPushNotificationConfig`` was v0.3-shaped: v0.3 wrapped ``url`` and
 ``token`` in a nested ``pushNotificationConfig`` object alongside an outer
 ``taskId``.  v1.0 **merged** that nested object's fields directly onto
@@ -15,7 +15,7 @@ missing.
 **pluralised** the list method (``ListTaskPushNotificationConfigs``, not
 ``ListTaskPushNotificationConfig``).  :class:`TaskPushNotificationConfig`
 below models the v1.0, flat shape; ``tests/test_a2a_v1_conformance.py`` pins
-that the v0.3 nested shape is rejected, the same guard F18 established for the
+that the v0.3 nested shape is rejected, the same guard used for the
 message envelope.
 
 **Wire format.**  A2A v1.0 defines this message in ``specification/a2a.proto``
@@ -30,7 +30,7 @@ leaves the caller unable to read the fields that *did* survive.
 each is the webhook receiver's problem, but this SDK holds them in memory and
 must never let them reach a log line.  ``mask_pii_in_dict``'s key-aware
 backstop (``pii.py``) treats any key whose name contains ``token`` or
-``credential`` as sensitive regardless of its content — added by this ticket
+``credential`` as sensitive regardless of its content — added
 specifically so a caller who logs ``config.to_dict()`` via
 ``extra={...}`` does not leak either value; ``tests/test_pii_in_logging.py``
 covers it.  Nothing in this module logs on its own — the risk is a caller
@@ -92,7 +92,7 @@ class AuthenticationInfo:
 class TaskPushNotificationConfig:
     """A2A ``TaskPushNotificationConfig`` (spec v1.0.1) — a task's webhook registration.
 
-    **Flat (F20)**: ``url`` and ``token`` are fields on this object directly,
+    **Flat**: ``url`` and ``token`` are fields on this object directly,
     not on a nested ``pushNotificationConfig`` — see the module docstring.
     ``id`` identifies *this* registration, distinct from ``task_id``: a task
     may have more than one config registered against it (v1.0 §3.1.7), which

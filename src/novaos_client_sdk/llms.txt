@@ -1,0 +1,25 @@
+# NovaOS Agent SDK
+
+> Python SDK for building and calling agents on NovaOS, over the Agent2Agent (A2A) protocol and the NovaOS Execution Gateway. Installed as `novaos-agent-sdk`, imported as `novaos_client_sdk`. Agents are shipped with the `novaos-cli` command line.
+
+Start with `AGENT_GUIDE.md`, next to this file in the installed package: it covers the build, test, publish, install and run lifecycle, the environment variables of the SDK and the CLI, and the steps that need a person. Never claim an agent is live while it is in review, never make up an instance ID, and never approve an agent yourself: a platform admin decides that.
+
+## Guides
+
+- [AGENT_GUIDE.md](AGENT_GUIDE.md): lifecycle, environment variables, install and run calls, steps that need a person
+- [Getting started](https://orbitronai-repo.github.io/novaos-agent-sdk/getting-started/): install, extras, first agent
+- [Building an agent](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/building-an-agent/): `AgentBuilder`, skills, the execution context
+- [Installing and running](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/installing-and-running/): install your copy of a published agent, run it, read the answer
+- [Steps that need a person](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/steps-that-need-a-person/): sign-in, admin approval, and how an assistant behaves at them
+- [Invoking agents](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/invoking-agents/): `Client` and `GatewayClient`
+
+## Reference
+
+- [API reference](https://orbitronai-repo.github.io/novaos-agent-sdk/reference/api/)
+- [Platform tools](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/platform-tools/): `ctx.tools`
+- [Authentication](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/authentication/)
+
+## Optional
+
+- [Changelog](https://orbitronai-repo.github.io/novaos-agent-sdk/changelog/)
+- [Versioning and support](https://orbitronai-repo.github.io/novaos-agent-sdk/versioning-and-support/)

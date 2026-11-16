@@ -11,6 +11,13 @@ recursive-include src/novaos_client_sdk *.typed
 # Include all Python source files
 recursive-include src *.py
 
+# Package data the installed code reads (the rubric schema)
+recursive-include src *.json
+
+# The guide for coding assistants and its llms.txt index
+include src/novaos_client_sdk/AGENT_GUIDE.md
+include src/novaos_client_sdk/llms.txt
+
 # Exclude unnecessary files
 global-exclude __pycache__
 global-exclude *.py[cod]

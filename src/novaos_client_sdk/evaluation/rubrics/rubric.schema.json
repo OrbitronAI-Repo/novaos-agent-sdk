@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+\\/[a-z0-9_]+$"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "owner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scale": {
+      "type": "object",
+      "properties": {
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        }
+      },
+      "required": ["min", "max"],
+      "additionalProperties": false
+    },
+    "threshold": {
+      "type": "number"
+    },
+    "applies_to": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "criteria": {
+      "minItems": 1,
+      "maxItems": 20,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "penalty": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "required": ["id", "text"],
+        "additionalProperties": false
+      }
+    },
+    "labelled_cases": {
+      "minItems": 1,
+      "maxItems": 200,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "input": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "output": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "contexts": {
+            "maxItems": 20,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 2000
+            }
+          },
+          "label": {
+            "type": "string",
+            "enum": ["good", "bad"]
+          }
+        },
+        "required": ["id", "input", "output", "label"],
+        "additionalProperties": false
+      }
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 8000,
+      "pattern": "(^|\\n)\\s*\\d+[.)]\\s+\\S"
+    }
+  },
+  "required": ["name", "version", "description", "owner", "criteria", "labelled_cases", "body"],
+  "additionalProperties": false
+}

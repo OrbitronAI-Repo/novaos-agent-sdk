@@ -43,6 +43,9 @@ from novaos_client_sdk.exceptions import (
     NovaOSError,
     NovaOSServerError,
 )
+from novaos_client_sdk.header_source import HeaderSource, resolve_headers
+from novaos_client_sdk.run_context import current_run, run_span_attributes
+from novaos_client_sdk.tracing import start_outbound_span
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +64,19 @@ class MCPTool:
         name: Fully qualified tool name (e.g., ``novaos.affirmations.generate_affirmation``).
         description: Human-readable description of what the tool does.
         input_schema: JSON Schema describing the tool's expected input parameters.
+        annotations: The MCP tool annotations (``readOnlyHint``, ``destructiveHint``...),
+            the server's own, unverified claims.
     """
 
     name: str
     description: str | None = None
     input_schema: dict[str, Any] | None = None
+    annotations: dict[str, Any] | None = None
+
+    @property
+    def read_only(self) -> bool:
+        """Whether the server says the tool only reads (``readOnlyHint: true``)."""
+        return (self.annotations or {}).get("readOnlyHint") is True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MCPTool":
@@ -74,6 +85,7 @@ class MCPTool:
             name=data["name"],
             description=data.get("description"),
             input_schema=data.get("inputSchema") or data.get("input_schema"),
+            annotations=data.get("annotations"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -129,14 +141,25 @@ class MCPClient:
     Args:
         base_url: MCP Gateway URL. If None, reads from ``MCP_GATEWAY_URL`` env var.
         headers: Additional HTTP headers (typically includes ``Authorization``).
+            Pass ``ctx.to_auth_headers`` (a callable, without the call) to read
+            them for every request; a mapping is read once.
         timeout: Request timeout in seconds.
+        execution_context: The run's context (``ctx`` in a skill). Only its
+            ``traceparent`` is read: each request is an ``mcp.<method>`` client
+            span, a child of the active span, and joins this ``traceparent``
+            when no span is active. Without OpenTelemetry the ``traceparent``
+            itself is sent, so the gateway's spans still land in the run's trace.
+            Omitted, the ``traceparent`` of the run whose skill makes the call
+            is used.
     """
 
     def __init__(
         self,
         base_url: str | None = None,
-        headers: dict[str, str] | None = None,
+        headers: HeaderSource | None = None,
         timeout: float | None = None,
+        *,
+        execution_context: Any | None = None,
     ) -> None:
         if base_url is None:
             base_url = os.getenv(MCP_GATEWAY_URL_ENV)
@@ -146,18 +169,21 @@ class MCPClient:
                     "environment variable is not set."
                 )
         self._base_url = base_url.rstrip("/")
-        self._headers = headers.copy() if headers else {}
+        self._header_source = headers
         self._timeout = timeout
         self._session_id: str | None = None
         self._client: httpx.AsyncClient | None = None
         self._request_id = 0
+        # `AgentExecutionContext` carries the inbound `traceparent`; the plain
+        # `ExecutionContext` has none.
+        self._traceparent = str(getattr(execution_context, "traceparent", "") or "")
 
     async def __aenter__(self) -> "MCPClient":
         """Async context manager entry."""
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=self._timeout,
-            headers=self._headers,
+            headers=resolve_headers(self._header_source),
         )
         return self
 
@@ -199,11 +225,15 @@ class MCPClient:
             request["params"] = params
         return request
 
-    def _build_headers(self) -> dict[str, str]:
+    def _build_headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Build request headers including session ID if available."""
         headers: dict[str, str] = {"Content-Type": "application/json"}
+        if callable(self._header_source):
+            # Per request, so a token renewed since the client was built is used.
+            headers.update(resolve_headers(self._header_source))
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
+        headers.update(extra or {})
         return headers
 
     def _update_session(self, response: httpx.Response) -> None:
@@ -212,12 +242,18 @@ class MCPClient:
         if session_id:
             self._session_id = session_id
 
-    async def _send_rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    async def _send_rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
         """Send a JSON-RPC 2.0 request and return the result.
 
         Args:
             method: JSON-RPC method name.
             params: Optional parameters.
+            headers: Headers for this request only.
 
         Returns:
             The ``result`` field from the JSON-RPC response.
@@ -229,10 +265,51 @@ class MCPClient:
         """
         client = self._ensure_client()
         request_body = self._build_request(method, params)
-        extra_headers = self._build_headers()
+        extra_headers = self._build_headers(headers)
+
+        # Each call is a client span in the run's trace, and the gateway is
+        # handed that span as its parent so its own spans nest under it. A
+        # client built without a context still finds the run it is called in.
+        run = current_run()
+        traceparent = self._traceparent or (run.traceparent if run is not None else "")
+        started = start_outbound_span(
+            f"mcp.{method}",
+            attributes={
+                "rpc.system": "jsonrpc",
+                "rpc.method": method,
+                "server.address": client.base_url.host,
+                **run_span_attributes(task=True),
+            },
+            fallback_traceparent=traceparent,
+        )
+        span = None
+        if started is not None:
+            span, carrier = started
+            extra_headers.update(carrier)
+        elif traceparent:
+            extra_headers["traceparent"] = traceparent
 
         try:
-            response = await client.post("/", json=request_body, headers=extra_headers)
+            return await self._post_rpc(client, request_body, extra_headers)
+        except Exception as e:
+            if span is not None:
+                from opentelemetry.trace import StatusCode
+
+                span.set_status(StatusCode.ERROR, str(e))
+            raise
+        finally:
+            if span is not None:
+                span.end()
+
+    async def _post_rpc(
+        self,
+        client: httpx.AsyncClient,
+        request_body: dict[str, Any],
+        headers: dict[str, str],
+    ) -> Any:
+        """POST one JSON-RPC envelope and return its ``result`` (see :meth:`_send_rpc`)."""
+        try:
+            response = await client.post("/", json=request_body, headers=headers)
             response.raise_for_status()
             self._update_session(response)
         except httpx.ConnectError as e:
@@ -281,7 +358,7 @@ class MCPClient:
 
         Example:
             ```python
-            async with MCPClient(headers=ctx.to_auth_headers()) as mcp:
+            async with MCPClient(headers=ctx.to_auth_headers) as mcp:
                 tools = await mcp.tools_list(query="affirmations")
                 for tool in tools:
                     print(f"{tool.name}: {tool.description}")
@@ -301,6 +378,9 @@ class MCPClient:
         self,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
+        *,
+        idempotency_key: str | None = None,
+        business_key: str | None = None,
     ) -> MCPToolResult:
         """Execute a tool via the MCP Gateway.
 
@@ -308,6 +388,12 @@ class MCPClient:
             tool_name: Fully qualified tool name
                 (e.g., ``novaos.affirmations.generate_affirmation``).
             arguments: Tool input arguments matching the tool's input schema.
+            idempotency_key: Sent as ``X-Idempotency-Key``. The gateway replays its
+                first reply for a repeated key and records a completed write
+                against the run only when one is sent, so use the same key only
+                for the same logical call (``ctx.tools`` derives one per call).
+            business_key: Sent as ``X-NovaOS-Business-Key``; stored with the
+                recorded write.
 
         Returns:
             MCPToolResult with the tool's response.
@@ -318,7 +404,7 @@ class MCPClient:
 
         Example:
             ```python
-            async with MCPClient(headers=ctx.to_auth_headers()) as mcp:
+            async with MCPClient(headers=ctx.to_auth_headers) as mcp:
                 result = await mcp.tools_call(
                     "novaos.affirmations.generate_affirmation",
                     arguments={"theme": "motivation"},
@@ -330,7 +416,12 @@ class MCPClient:
         if arguments is not None:
             params["arguments"] = arguments
 
-        result = await self._send_rpc("tools/call", params)
+        headers: dict[str, str] = {}
+        if idempotency_key:
+            headers["X-Idempotency-Key"] = idempotency_key
+        if business_key:
+            headers["X-NovaOS-Business-Key"] = business_key
+        result = await self._send_rpc("tools/call", params, headers)
 
         return MCPToolResult.from_dict(result if isinstance(result, dict) else {"content": result})
 

@@ -59,6 +59,7 @@ nav:
       - Building an agent: guides/building-an-agent.md
       - Platform tools: guides/platform-tools.md
       - Agent memory: guides/memory.md
+      - Agent loop: guides/agent-loop.md
       - Error handling: guides/error-handling.md
       - Migrating from 1.x: guides/migrating-from-1x.md
   - Reference:

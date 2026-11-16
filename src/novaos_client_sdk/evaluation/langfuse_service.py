@@ -8,9 +8,9 @@ LLM-as-judge evaluators (faithfulness, relevance, context_relevance) run
 inside the SDK via ``run_llm_evaluator``.  The judge LLM call goes through
 the LLM Gateway (OpenAI-compatible ``/v1/chat/completions``), so it inherits
 tracing, budget enforcement, and rate limiting.  The ``metadata`` field on
-the request includes ``turn_off_message_logging: true`` to prevent the judge
-prompt (which contains the agent's full transcript) from being persisted in
-Langfuse by the Gateway.
+the request carries the judge tag.  The Gateway runs with message logging off,
+so the judge prompt (which contains the agent's full transcript) is not
+persisted in Langfuse.
 
 All operations degrade gracefully when the ``langfuse`` package is not
 installed or the service is unreachable.
@@ -215,8 +215,8 @@ class LangfuseService:
         """Run an LLM-as-judge evaluator and write the numeric score to Langfuse.
 
         The judge call goes through the LLM Gateway (``/v1/chat/completions``)
-        with ``turn_off_message_logging: true`` in the request metadata to
-        prevent PII leakage.  The resulting float score (0.0–1.0) is written
+        with the judge tag in the request metadata; the Gateway keeps message
+        logging off, which prevents PII leakage.  The resulting float score (0.0–1.0) is written
         to the Langfuse trace.  No reasoning text or transcript content is
         persisted — only the numeric score and score name.
 

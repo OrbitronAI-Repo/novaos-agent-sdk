@@ -17,6 +17,8 @@ Requires Python 3.12+. A few features need an optional extra:
 | `evaluation` | `langfuse`, `openai` | The offline/CI agent-evaluation harness |
 | `migrate` | `libcst` | `python -m novaos_client_sdk.migrate transform` (the 1.x-to-2.x codemod) |
 | `grpc` | `a2a-sdk` (schema only), `grpcio` | The gRPC A2A protocol binding |
+| `agent-loop` | `langgraph`, `langgraph-checkpoint` | `AgentLoop` and `NovaCheckpointSaver` |
+| `baml` | `baml-py` | `novaos_client_sdk.baml_helpers` (BAML calls through the LLM Gateway) |
 | `all` | everything above | — |
 
 ```bash

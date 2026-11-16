@@ -25,8 +25,9 @@ Provides a typed async client for the NovaOS Memory Service MCP endpoint.
 
    **Authorization model (reconciliation with OPA policy):**
 
-   - The caller must pass ``headers=ctx.to_auth_headers()``, which forwards
-     ``Authorization: Bearer <execution_token>`` to the Memory Service.
+   - The caller must pass ``headers=ctx.to_auth_headers`` (the method, without
+     the call), which forwards ``Authorization: Bearer <execution_token>`` to the
+     Memory Service.
    - The Memory Service validates the same RS256 execution-token shape
      (issuer, expiry, core claims including ``tenant_id``) as the MCP Gateway
      does. **MCP Gateway OPA evaluation and gateway rate limits are not in
@@ -65,7 +66,7 @@ Example:
 
     ctx = ExecutionContext.from_headers(request.headers)
 
-    async with MemoryClient(headers=ctx.to_auth_headers()) as mem:
+    async with MemoryClient(headers=ctx.to_auth_headers) as mem:
         # Write agent-scoped operational knowledge
         result = await mem.write(
             scope="agent",
@@ -95,20 +96,28 @@ Example:
 import asyncio
 import logging
 import os
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from novaos_client_sdk._http import httpx
-from novaos_client_sdk._http_error import status_error_details, status_error_message
+from novaos_client_sdk._http_error import (
+    status_error_details,
+    status_error_message,
+    status_error_retry_after,
+)
 from novaos_client_sdk._resilience import CircuitBreaker as _CircuitBreaker
 from novaos_client_sdk._resilience import backoff_delay
 from novaos_client_sdk.exceptions import (
     NovaOSConnectionError,
     NovaOSError,
+    NovaOSQuotaExceededError,
     NovaOSServerError,
     NovaOSValidationError,
 )
+from novaos_client_sdk.header_source import HeaderSource, resolve_headers
 from novaos_client_sdk.tracing import inject_trace_headers, traced_tool_call
 
 if TYPE_CHECKING:
@@ -117,6 +126,85 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MEMORY_SERVICE_URL_ENV = "MEMORY_SERVICE_URL"
+
+#: Warn when the space left in a write quota is at or below this share of its limit.
+DEFAULT_QUOTA_WARNING_THRESHOLD = 0.1
+
+#: Seconds between two near-limit warnings for the same scope, so a busy agent
+#: writing every turn does not fill its log with the same line.
+_QUOTA_WARNING_INTERVAL_S = 60.0
+
+
+@dataclass(frozen=True)
+class QuotaStatus:
+    """The write quota of one scope, as the Memory Service reported it on a write.
+
+    Attributes:
+        scope: Scope the write went to (``user``, ``agent``, ``tenant``, ...).
+        remaining: Writes left before the limit.
+        limit: The scope's limit.
+        reset_at: ISO-8601 time the counter resets, or ``None`` for a durable
+            scope (user, agent, tenant). A durable quota counts stored rows and
+            never resets on its own: space comes back only when memories are
+            deleted or the tenant's limit is raised.
+    """
+
+    scope: str
+    remaining: int
+    limit: int
+    reset_at: str | None = None
+
+    @property
+    def fraction_remaining(self) -> float:
+        """Share of the limit still free (``1.0`` when the limit is not positive)."""
+        return self.remaining / self.limit if self.limit > 0 else 1.0
+
+
+_QUOTA_EXCEEDED_CODE = "QUOTA_EXCEEDED"
+
+
+def _quota_error_code(errors: Any) -> str | None:
+    """Return the error code when *errors* says a quota is full, else ``None``.
+
+    The service marks a full quota ``QUOTA_EXCEEDED`` with ``retryable=false``:
+    waiting does not free the space.  A 429 that is a plain rate limit
+    (``RATE_LIMIT_EXCEEDED``, retryable) does not match and is still retried.
+    """
+    if not isinstance(errors, list):
+        return None
+    for item in errors:
+        if isinstance(item, dict) and item.get("error_code") == _QUOTA_EXCEEDED_CODE:
+            return _QUOTA_EXCEEDED_CODE
+    return None
+
+
+def _envelope_error(errors: list[Any]) -> NovaOSServerError:
+    """Build the SDK error for an ``errors`` array in a Memory Service envelope."""
+    first = errors[0] if errors else {}
+    message = f"Memory Service error: {first.get('title', 'Unknown')} — {first.get('detail', '')}"
+    code = _quota_error_code(errors)
+    if code:
+        return NovaOSQuotaExceededError(
+            message, error_code=code, status_code=first.get("status"), details={"errors": errors}
+        )
+    return NovaOSServerError(message, status_code=first.get("status"), details={"errors": errors})
+
+
+def _status_error(e: Any) -> NovaOSServerError:
+    """Build the SDK error for a non-2xx Memory Service response."""
+    status = e.response.status_code
+    retry_after = status_error_retry_after(e) if status == 429 else None
+    message = status_error_message("Memory Service", e)
+    details = status_error_details(e)
+    if status == 429:
+        body = details.get("response_body")
+        code = _quota_error_code(body.get("errors") if isinstance(body, dict) else None)
+        if code:
+            return NovaOSQuotaExceededError(
+                message, error_code=code, status_code=status, details=details
+            )
+    return NovaOSServerError(message, status_code=status, retry_after=retry_after, details=details)
+
 
 _WRITE_ORDINAL_ATTR = "_novaos_memory_write_ordinal"
 
@@ -527,7 +615,9 @@ class MemoryClient:
         base_url: Memory Service URL. If None, reads from ``MEMORY_SERVICE_URL``
             env var.
         headers: Additional HTTP headers (typically includes ``Authorization``
-            from ``ExecutionContext.to_auth_headers()``).
+            from ``ExecutionContext.to_auth_headers()``). Pass the method
+            itself (``ctx.to_auth_headers``, without the call) to read them for
+            every request, so a long-lived client keeps a valid token.
         timeout: Request timeout in seconds (default: 30).
         max_retries: Maximum total attempts for retryable errors (default: 3).
             Always issues at least one attempt, even when set to ``0`` --
@@ -542,12 +632,22 @@ class MemoryClient:
             transports/interceptors. If provided, MemoryClient will NOT
             close it on __aexit__ — the caller retains ownership of its
             lifecycle.
+        quota_warning_threshold: Warn (and call ``on_quota_low``) when a write
+            leaves this share of the scope's limit or less (default: 0.1).
+            ``0`` turns the warning off. A durable quota has no reset, so a
+            warning means the scope will refuse writes until memories are
+            deleted or the limit is raised.
+        on_quota_low: Optional callback taking a :class:`QuotaStatus`, called on
+            every write at or below the threshold. An exception it raises is
+            logged and never fails the write.
+
+    The latest quota seen per scope is in :attr:`last_quota`.
 
     Example:
         ```python
         ctx = ExecutionContext.from_headers(request.headers)
 
-        async with MemoryClient(headers=ctx.to_auth_headers()) as mem:
+        async with MemoryClient(headers=ctx.to_auth_headers) as mem:
             result = await mem.query(scope="user", query="preferences")
             for item in result.items:
                 print(item.content)
@@ -557,13 +657,15 @@ class MemoryClient:
     def __init__(
         self,
         base_url: str | None = None,
-        headers: dict[str, str] | None = None,
+        headers: HeaderSource | None = None,
         timeout: float = 30.0,
         max_retries: int = 3,
         circuit_breaker_threshold: int = 5,
         circuit_breaker_reset_s: float = 30.0,
         *,
         client: httpx.AsyncClient | None = None,
+        quota_warning_threshold: float = DEFAULT_QUOTA_WARNING_THRESHOLD,
+        on_quota_low: Callable[[QuotaStatus], None] | None = None,
     ) -> None:
         if base_url is None:
             base_url = os.getenv(MEMORY_SERVICE_URL_ENV)
@@ -573,13 +675,23 @@ class MemoryClient:
                     "environment variable is not set."
                 )
         self._base_url = base_url.rstrip("/")
-        self._headers = headers.copy() if headers else {}
+        self._header_source = headers
         self._timeout = timeout
         self._max_retries = max_retries
         self._cb = _CircuitBreaker(circuit_breaker_threshold, circuit_breaker_reset_s)
         self._client: httpx.AsyncClient | None = None
         self._injected_client = client
         self._owns_client: bool = False
+        self._quota_warning_threshold = quota_warning_threshold
+        self._on_quota_low = on_quota_low
+        self._quota_warned_at: dict[str, float] = {}
+        self.last_quota: dict[str, QuotaStatus] = {}
+        """Latest write quota seen per scope; empty until a write reports one."""
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        """The headers as they would be sent now (a copy)."""
+        return resolve_headers(self._header_source)
 
     async def __aenter__(self) -> "MemoryClient":
         """Async context manager entry."""
@@ -590,7 +702,7 @@ class MemoryClient:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=self._timeout,
-                headers=self._headers,
+                headers=resolve_headers(self._header_source),
             )
             self._owns_client = True
         return self
@@ -658,7 +770,10 @@ class MemoryClient:
             except NovaOSError as e:
                 last_error = e
                 if not e.is_retryable or attempt == total_attempts:
-                    self._cb.record_failure()
+                    # A full quota is a healthy service saying no; it must not
+                    # trip the breaker and fail-fast the reads that still work.
+                    if not isinstance(e, NovaOSQuotaExceededError):
+                        self._cb.record_failure()
                     raise
 
                 delay = e.retry_after if e.retry_after else backoff_delay(attempt)
@@ -673,6 +788,53 @@ class MemoryClient:
 
         self._cb.record_failure()
         raise last_error  # type: ignore[misc]
+
+    def _observe_quota(self, tool: str, payload: dict[str, Any], envelope: dict[str, Any]) -> None:
+        """Record ``meta.quota`` from a write and warn when the scope is nearly full.
+
+        Never raises: a malformed ``meta`` or a failing callback must not fail a
+        write the service accepted.
+        """
+        if tool != "memory.write":
+            return
+        try:
+            quota = (envelope.get("meta") or {}).get("quota")
+            if not isinstance(quota, dict):
+                return
+            scope = str(payload.get("scope", ""))
+            status = QuotaStatus(
+                scope=scope,
+                remaining=int(quota["remaining"]),
+                limit=int(quota["limit"]),
+                reset_at=quota.get("reset_at"),
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return
+
+        self.last_quota[scope] = status
+        if self._quota_warning_threshold <= 0 or status.fraction_remaining > (
+            self._quota_warning_threshold
+        ):
+            return
+
+        now = time.monotonic()
+        last = self._quota_warned_at.get(scope)
+        if last is None or now - last >= _QUOTA_WARNING_INTERVAL_S:
+            self._quota_warned_at[scope] = now
+            logger.warning(
+                "Memory write quota for scope %r is nearly full: %d of %d left%s. "
+                "Writes are refused at 0; free space by deleting memories or ask the "
+                "tenant admin to raise the limit.",
+                scope,
+                status.remaining,
+                status.limit,
+                "" if status.reset_at else " (no reset: counts stored memories)",
+            )
+        if self._on_quota_low is not None:
+            try:
+                self._on_quota_low(status)
+            except Exception:  # noqa: BLE001 - a callback must never fail the write
+                logger.exception("on_quota_low callback raised")
 
     async def _send_mcp_once(
         self,
@@ -704,10 +866,10 @@ class MemoryClient:
             try:
                 # Merge auth headers explicitly rather than relying on the client's own
                 # default headers — an injected client (see `client=` on __init__) may not
-                # have been constructed with self._headers baked in, and silently dropping
+                # have been constructed with the headers baked in, and silently dropping
                 # them would send an unauthenticated request instead of failing loudly.
                 trace_headers = inject_trace_headers({})
-                request_headers = {**self._headers, **trace_headers}
+                request_headers = {**resolve_headers(self._header_source), **trace_headers}
                 response = await client.post("/api/v1/mcp", json=body, headers=request_headers)
                 response.raise_for_status()
             except httpx.ConnectError as e:
@@ -721,32 +883,14 @@ class MemoryClient:
                     details={"original_error": type(e).__name__},
                 ) from e
             except httpx.HTTPStatusError as e:
-                retry_after = None
-                if e.response.status_code == 429:
-                    ra_header = e.response.headers.get("Retry-After")
-                    if ra_header:
-                        try:
-                            retry_after = float(ra_header)
-                        except ValueError:
-                            pass
-                raise NovaOSServerError(
-                    status_error_message("Memory Service", e),
-                    status_code=e.response.status_code,
-                    retry_after=retry_after,
-                    details=status_error_details(e),
-                ) from e
+                raise _status_error(e) from e
 
             envelope = response.json()
 
             if envelope.get("errors"):
-                errors = envelope["errors"]
-                first = errors[0] if errors else {}
-                raise NovaOSServerError(
-                    f"Memory Service error: {first.get('title', 'Unknown')} — {first.get('detail', '')}",
-                    status_code=first.get("status"),
-                    details={"errors": errors},
-                )
+                raise _envelope_error(envelope["errors"])
 
+            self._observe_quota(tool, payload, envelope)
             return envelope.get("data", {})
 
     async def _get_json(
@@ -782,7 +926,10 @@ class MemoryClient:
             except NovaOSError as e:
                 last_error = e
                 if not e.is_retryable or attempt == total_attempts:
-                    self._cb.record_failure()
+                    # A full quota is a healthy service saying no; it must not
+                    # trip the breaker and fail-fast the reads that still work.
+                    if not isinstance(e, NovaOSQuotaExceededError):
+                        self._cb.record_failure()
                     raise
 
                 delay = e.retry_after if e.retry_after else backoff_delay(attempt)
@@ -810,7 +957,7 @@ class MemoryClient:
         client = self._ensure_client()
 
         trace_headers = inject_trace_headers({})
-        request_headers = {**self._headers, **trace_headers}
+        request_headers = {**resolve_headers(self._header_source), **trace_headers}
         if request_id:
             request_headers["X-Request-Id"] = request_id
         if trace_id:
@@ -830,31 +977,12 @@ class MemoryClient:
                 details={"original_error": type(e).__name__},
             ) from e
         except httpx.HTTPStatusError as e:
-            retry_after = None
-            if e.response.status_code == 429:
-                ra_header = e.response.headers.get("Retry-After")
-                if ra_header:
-                    try:
-                        retry_after = float(ra_header)
-                    except ValueError:
-                        pass
-            raise NovaOSServerError(
-                status_error_message("Memory Service", e),
-                status_code=e.response.status_code,
-                retry_after=retry_after,
-                details=status_error_details(e),
-            ) from e
+            raise _status_error(e) from e
 
         envelope = response.json()
 
         if envelope.get("errors"):
-            errors = envelope["errors"]
-            first = errors[0] if errors else {}
-            raise NovaOSServerError(
-                f"Memory Service error: {first.get('title', 'Unknown')} — {first.get('detail', '')}",
-                status_code=first.get("status"),
-                details={"errors": errors},
-            )
+            raise _envelope_error(envelope["errors"])
 
         return envelope.get("data", {})
 

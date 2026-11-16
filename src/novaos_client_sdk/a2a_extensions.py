@@ -79,7 +79,7 @@ __all__ = [
 #: The header a caller activates extensions with, and an agent echoes activated
 #: ones back in (A2A v1.0).  Spelled without an ``X-`` prefix: that form
 #: (``X-A2A-Extensions``) is v0.3's, kept alive only by the reference
-#: implementation's v0.3 compatibility shim.  NovaOS is pinned to v1.0 (ADR F17)
+#: implementation's v0.3 compatibility shim.  NovaOS is pinned to v1.0
 #: and every NovaOS surface already answers ``-32009`` to a v0.3 caller before
 #: any extension is looked at, so accepting the legacy spelling here would be
 #: code no request could reach.  ``tests/test_a2a_v1_conformance.py`` pins this
@@ -228,7 +228,7 @@ class A2AExtension:
         rather than something frozen at construction.
 
         **Whatever this returns is plain JSON on the wire.**  The A2A extension
-        mechanism provides no confidentiality (ADR F7/G1), so an extension
+        mechanism provides no confidentiality, so an extension
         carrying anything sensitive must encrypt it here, not assume the
         transport did.
 

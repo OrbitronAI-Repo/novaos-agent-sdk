@@ -61,7 +61,7 @@ class TaskState(StrEnum):
     """A2A ``TaskState`` (spec v1.0.1).
 
     Values are the proto enum's value names, which is what proto3 JSON emits.
-    The ACP statuses these replace (ADR F2):
+    The ACP statuses these replace:
 
     ==========================  ==========================
     ACP                         A2A
@@ -124,7 +124,7 @@ def task_state_from_wire(value: Any) -> TaskState:
     v0.3's lowercase spellings (``"completed"``, ``"input-required"``) are
     **not** accepted.  Tolerating them here would let a v0.3 peer look like it
     was working while every other part of the exchange failed, which is the
-    looks-compliant-but-is-not shape ADR F18 found; a v0.3 pod is rejected at the
+    looks-compliant-but-is-not shape an earlier audit found; a v0.3 pod is rejected at the
     version header long before its task states matter.
     """
     try:
@@ -162,7 +162,7 @@ class TaskStatus:
 
     ``message`` is how an agent says *why* a task reached this state.  A
     terminal state without one leaves the caller with a finished run and no
-    explanation, which is the failure mode recorded in KB-15 — so
+    explanation, which is the failure mode of a run that finishes with no explanation — so
     :class:`~novaos_client_sdk.agent_builder.AgentBuilder` always attaches one
     when it fails a task.
     """
@@ -208,7 +208,7 @@ class Task:
     **``status.message`` is not redundant with it.**  The two answer different
     questions and A2A keeps both: the artifact is *what the task produced*, the
     status message is *what the agent has to say about reaching this state*.  A
-    terminal task always carries the latter — KB-15's failure mode is a finished
+    terminal task always carries the latter — the failure mode to avoid is a finished
     run with no explanation — while a task that failed before producing anything
     legitimately carries no artifacts at all.
     """
@@ -294,8 +294,8 @@ class Task:
 class TaskList:
     """A2A ``ListTasksResponse`` (spec v1.0.1) — one page of an agent's tasks.
 
-    ``ListTasks`` had **no SDK representation at all** before this class: ADR
-    finding F13 caught that it was missing from the migration's original client
+    ``ListTasks`` had **no SDK representation at all** before this class: it
+    was missing from the migration's original client
     method list, so nothing modelled either the request or its answer.  It is the
     one A2A operation with no ACP counterpart whatsoever — ACP could not
     enumerate an agent's runs — which is why there is nothing here to map from.

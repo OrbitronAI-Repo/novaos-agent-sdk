@@ -55,6 +55,7 @@ from typing import Any, Final
 from urllib.parse import urljoin
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_retry_after
 from novaos_client_sdk._ssrf import checked_async_transport
 from novaos_client_sdk.a2a_agent_card import (
     AGENT_CARD_WELL_KNOWN_PATH,
@@ -533,23 +534,6 @@ class AgentDiscoveryService:
         )
 
 
-def _retry_after(response: httpx.Response) -> float | None:
-    """Read a ``Retry-After`` delay in seconds, or ``None``.
-
-    Only the delta-seconds form, matching
-    :meth:`novaos_client_sdk.client.Client._map_exception`: an HTTP-date value
-    yields ``None`` rather than a guess, and a malformed header is ignored rather
-    than failing the request a second time.
-    """
-    header = response.headers.get("Retry-After")
-    if header is None:
-        return None
-    try:
-        return float(header)
-    except ValueError:
-        return None
-
-
 def _status_error(error: httpx.HTTPStatusError, card_url: str) -> NovaOSError:
     """Map a non-2xx Agent Card response onto the SDK's exception hierarchy.
 
@@ -579,7 +563,7 @@ def _status_error(error: httpx.HTTPStatusError, card_url: str) -> NovaOSError:
     if status == 429:
         return NovaOSRateLimitError(
             f"Rate limited fetching the Agent Card at {card_url}",
-            retry_after=_retry_after(error.response),
+            retry_after=status_error_retry_after(error),
             details=details,
         )
     if status >= 500:

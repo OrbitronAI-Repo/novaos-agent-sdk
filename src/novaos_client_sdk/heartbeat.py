@@ -55,7 +55,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from novaos_client_sdk._http import httpx
-from novaos_client_sdk._http_error import status_error_details, status_error_message
+from novaos_client_sdk._http_error import (
+    status_error_details,
+    status_error_message,
+    status_error_retry_after,
+)
 from novaos_client_sdk._resilience import CircuitBreaker as _CircuitBreaker
 from novaos_client_sdk._resilience import backoff_delay
 from novaos_client_sdk.exceptions import (
@@ -434,14 +438,7 @@ class HeartbeatClient:
                     details={"original_error": type(e).__name__},
                 ) from e
             except httpx.HTTPStatusError as e:
-                retry_after = None
-                if e.response.status_code == 429:
-                    ra_header = e.response.headers.get("Retry-After")
-                    if ra_header:
-                        try:
-                            retry_after = float(ra_header)
-                        except ValueError:
-                            pass
+                retry_after = status_error_retry_after(e) if e.response.status_code == 429 else None
                 raise NovaOSServerError(
                     status_error_message("agent-ops", e),
                     status_code=e.response.status_code,

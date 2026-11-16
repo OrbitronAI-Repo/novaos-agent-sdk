@@ -112,6 +112,10 @@ discovered = await ctx.tools.agents.discover(query="summarization")
 
 This is a governed, token-chained call — distinct from using [`Client`](../reference/api.md#novaos_client_sdk.client) directly, which is for a standalone process rather than a running agent's own skill.
 
+## Your own MCP servers: `call_mcp_tool`
+
+A tool on an MCP server your agent declares in its manifest is not a bypass. Call it with `ctx.tools.connectors.call_mcp_tool("<publisher>.<server>.<tool>", arguments)`; it goes through the same MCP Gateway path as every other binding, so the platform still enforces your agent's entitlements and the call produces the same tool events, and it does not log the "bypassing" warning. The SDK does not read your manifest, so the Gateway is what rejects an undeclared server. A platform tool (`novaos.*`) is refused with a `ValueError` before anything is sent: use its own binding. Calls are not retried.
+
 ## Escape hatch: `call_ungoverned_tool`
 
 If you need to reach an MCP tool that has no first-class binding above, `ctx.tools.<any binding>.call_ungoverned_tool(tool_name, arguments)` is available on every binding class. It bypasses the SDK's typed tool surface — the platform's own policy may still deny the call — and is logged as a warning each time it's used. Treat repeated use of this for the same tool as a signal that the SDK should grow a proper binding for it, not as a long-term pattern.

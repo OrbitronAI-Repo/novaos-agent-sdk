@@ -36,7 +36,7 @@ and every JSON binding carries the proto3 JSON mapping of it, so the keys are
 ``artifactId``, ``name``, ``description``, ``parts``, ``metadata`` and
 ``extensions``.  That list is closed: a conformant peer parses with
 unknown-field rejection on and answers ``-32602 ... has no field named "x"`` for
-anything else — the exact failure F18 found when NovaOS emitted A2A v0.3's
+anything else — the exact failure seen when NovaOS emitted A2A v0.3's
 hand-rolled JSON at a v1.0 peer.
 
 **That closed list is why ``revision`` is not a top-level key.**  A2A has no

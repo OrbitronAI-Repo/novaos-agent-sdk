@@ -140,6 +140,18 @@ class ExecutionContext:
             execution_token=token,
         )
 
+    def current_token(self) -> str | None:
+        """The run's newest execution token, or the one this context holds.
+
+        A run that outlives its token gets the newer one the platform has sent
+        since (see :mod:`novaos_client_sdk.current_token`).
+        """
+        if not self.execution_token:
+            return self.execution_token
+        from novaos_client_sdk.current_token import default_source
+
+        return default_source().current(self.run_id or "", self.execution_token)
+
     def require_token(self) -> str:
         """Return the execution token, raising if it is absent.
 
@@ -157,9 +169,10 @@ class ExecutionContext:
         """
         from novaos_client_sdk.exceptions import MissingExecutionTokenError
 
-        if not self.execution_token:
+        token = self.current_token()
+        if not token:
             raise MissingExecutionTokenError()
-        return self.execution_token
+        return token
 
     def to_auth_headers(self) -> dict[str, str]:
         """Build outbound ``Authorization`` header from the execution token.
@@ -184,8 +197,9 @@ class ExecutionContext:
                 task = await client.send_message(text)
             ```
         """
-        if self.execution_token:
-            return {"Authorization": f"Bearer {self.execution_token}"}
+        token = self.current_token()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
         return {}
 
     @property
@@ -227,8 +241,9 @@ class ExecutionContext:
             headers[HEADER_AGENT_ID] = self.agent_id
         if self.instance_id:
             headers[HEADER_INSTANCE_ID] = self.instance_id
-        if self.execution_token:
-            headers[HEADER_EXECUTION_TOKEN] = self.execution_token
+        token = self.current_token()
+        if token:
+            headers[HEADER_EXECUTION_TOKEN] = token
         return headers
 
 
@@ -243,6 +258,8 @@ class MemoryNamespace:
     def __init__(self, ctx: ExecutionContext) -> None:
         self._ctx = ctx
         self._prefetched: AssembleResult | None = None
+        # What the pre-fetch asked about, so a reader can tell whether it answers its own question.
+        self.context_query: str | None = None
 
     @property
     def context(self) -> AssembleResult | None:
@@ -272,6 +289,6 @@ class MemoryNamespace:
 
         self._ctx.require_token()
         return MemoryClient(
-            headers=self._ctx.to_auth_headers(),
+            headers=self._ctx.to_auth_headers,
             **kwargs,
         )

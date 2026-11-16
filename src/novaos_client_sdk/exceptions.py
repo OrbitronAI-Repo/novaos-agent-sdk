@@ -56,7 +56,7 @@ from typing import Any, ClassVar, Final
 _RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 
 # The A2A specification release the ``A2AProtocolError`` subtree is written
-# against.  Pinned per ADR finding F17 and kept in step with
+# against.  Pinned, and kept in step with
 # ``a2a_types.A2A_SPEC_VERSION`` — bumping it is a deliberate edit, not drift.
 A2A_ERROR_SPEC_VERSION: Final = "1.0.1"
 
@@ -223,6 +223,41 @@ class NovaOSServerError(NovaOSError):
     @property
     def is_retryable(self) -> bool:
         return self.status_code in _RETRYABLE_STATUS_CODES
+
+
+class NovaOSQuotaExceededError(NovaOSServerError):
+    """Raised when the Memory Service refuses a write because a quota is full.
+
+    A subclass of :class:`NovaOSServerError` so existing ``except NovaOSServerError``
+    handlers keep catching it.  Never retryable: the service marks the 429 as
+    ``retryable=false`` because waiting does not free the space; only deleting
+    memories or raising the tenant's limit does.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        status_code: int | None = 429,
+        retry_after: float | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize quota error.
+
+        Args:
+            message: Human-readable error message
+            error_code: The service's machine-readable code (``QUOTA_EXCEEDED``)
+            status_code: HTTP status code (429)
+            retry_after: Unused for a full quota; accepted for base-class substitutability
+            details: Optional additional error details
+        """
+        super().__init__(message, status_code=status_code, retry_after=retry_after, details=details)
+        self.error_code = error_code
+
+    @property
+    def is_retryable(self) -> bool:
+        return False
 
 
 class NovaOSDNSError(NovaOSError):

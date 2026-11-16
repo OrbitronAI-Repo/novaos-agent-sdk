@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_retry_after
 from novaos_client_sdk._idna import wire_hostname as _wire_hostname
 from novaos_client_sdk._idna import wire_suffix as _wire_suffix
 from novaos_client_sdk._ssrf import is_blocked_ip
@@ -283,7 +284,7 @@ class AgentDNSRecord:
         trust_url: bool = False,
         **client_kwargs: Any,
     ) -> Client:
-        """Create ACP client from DNS record.
+        """Create an A2A :class:`Client` from this DNS record.
 
         **Trust is opt-in, not the default.** This URL comes from the
         Agent-DNS registry the caller explicitly configured and queried by
@@ -499,15 +500,9 @@ class AgentDNSClient:
                     details={"status_code": status_code, "original_error": error_type},
                 )
             if status_code == 429:
-                retry_after = None
-                if "Retry-After" in error.response.headers:
-                    try:
-                        retry_after = float(error.response.headers["Retry-After"])
-                    except ValueError:
-                        pass
                 return NovaOSDNSRateLimitError(
                     f"DNS service rate limit exceeded: {error_str}",
-                    retry_after=retry_after,
+                    retry_after=status_error_retry_after(error),
                     details={"status_code": status_code, "original_error": error_type},
                 )
 
@@ -691,7 +686,7 @@ class AgentDNSClient:
         """Discover an agent by name and return a connected :class:`Client`.
 
         Uses the ``allowed_host_suffixes`` configured on this DNS client
-        instance for URL validation before constructing the ACP client.
+        instance for URL validation before constructing the :class:`Client`.
 
         Args:
             name: Agent name to look up.

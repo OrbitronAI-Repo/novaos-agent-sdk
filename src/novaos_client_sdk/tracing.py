@@ -21,6 +21,8 @@ Or programmatically::
     )
 """
 
+import asyncio
+import logging
 import os
 import re
 import time
@@ -33,6 +35,8 @@ _OTEL_SERVICE_NAME_ENV = "OTEL_SERVICE_NAME"
 _OTEL_HEADERS_ENV = "OTEL_EXPORTER_OTLP_HEADERS"
 
 _otel_configured = False
+_otel_missing_warned = False
+_TELEMETRY_LOGGER = "novaos.sdk.telemetry"
 
 _tracer = None
 _meter = None
@@ -109,6 +113,16 @@ def get_traceparent() -> str:
         if tp:
             return tp
     return os.environ.get("TRACEPARENT", "")
+
+
+def current_span_ids() -> tuple[str, str]:
+    """The active span's ``(trace_id, span_id)`` in hex, or ``("", "")`` when none is active."""
+    if not _HAS_OTEL:
+        return "", ""
+    span_context = trace.get_current_span().get_span_context()
+    if not span_context.is_valid:
+        return "", ""
+    return format(span_context.trace_id, "032x"), format(span_context.span_id, "016x")
 
 
 def is_valid_traceparent(value: str) -> bool:
@@ -225,6 +239,89 @@ def traced_gateway_call(
             raise
 
 
+def _warn_otel_missing_once() -> None:
+    """Say, once per process, that an exporter was requested but cannot start."""
+    global _otel_missing_warned
+    if _otel_missing_warned:
+        return
+    _otel_missing_warned = True
+    logging.getLogger(_TELEMETRY_LOGGER).warning(
+        "Tracing was requested (%s is set) but the OpenTelemetry packages are not installed, "
+        "so no spans will be exported. Install them with: pip install 'novaos-agent-sdk[otel]'",
+        _OTEL_ENDPOINT_ENV,
+    )
+
+
+def context_from_traceparent(traceparent: str) -> Any | None:
+    """An OpenTelemetry context whose active span is the one named by ``traceparent``.
+
+    Pass it as ``context=`` when starting a span so the new span joins the
+    caller's trace instead of starting its own. Returns ``None`` when OpenTelemetry
+    is not installed or ``traceparent`` is empty or malformed, in which case a
+    span started with ``context=None`` behaves exactly as it did before.
+    """
+    if not _HAS_OTEL or not traceparent:
+        return None
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    context = TraceContextTextMapPropagator().extract({"traceparent": traceparent})
+    return context if trace.get_current_span(context).get_span_context().is_valid else None
+
+
+def start_outbound_span(
+    name: str,
+    *,
+    attributes: dict[str, Any] | None = None,
+    fallback_traceparent: str = "",
+) -> tuple[Any, dict[str, str]] | None:
+    """Start a client span for an outbound call and return it with the headers to send.
+
+    The span is a child of the current span. When no span is active (a call made
+    outside a skill), it joins ``fallback_traceparent`` instead, so the callee's
+    spans still land in the run's trace. The caller must end the span.
+
+    Returns ``None`` when OpenTelemetry is not installed.
+    """
+    tracer = _get_tracer() if _HAS_OTEL else None
+    if tracer is None:
+        return None
+    parent = None
+    if not trace.get_current_span().get_span_context().is_valid:
+        parent = context_from_traceparent(fallback_traceparent)
+    span = tracer.start_span(name, context=parent, attributes=attributes)
+    carrier: dict[str, str] = {}
+    inject(carrier, context=trace.set_span_in_context(span, parent))
+    return span, carrier
+
+
+def flush_traces(timeout_ms: int = 2000) -> bool:
+    """Export any spans still buffered by the tracer provider, waiting at most ``timeout_ms``.
+
+    The batch processor exports in the background, and an on-demand agent pod can
+    be torn down right after it responds, so the last batch has to be flushed
+    before the response leaves. A no-op returning ``True`` when OpenTelemetry is
+    not installed or the provider cannot flush; ``False`` when the flush timed out
+    or failed. Never raises.
+    """
+    if not _HAS_OTEL:
+        return True
+    force_flush = getattr(trace.get_tracer_provider(), "force_flush", None)
+    if force_flush is None:
+        return True
+    try:
+        return bool(force_flush(timeout_millis=timeout_ms))
+    except Exception:
+        logging.getLogger(_TELEMETRY_LOGGER).debug("span flush failed", exc_info=True)
+        return False
+
+
+async def aflush_traces(timeout_ms: int = 2000) -> bool:
+    """:func:`flush_traces` run off the event loop, so a slow collector cannot stall it."""
+    if not _HAS_OTEL:
+        return True
+    return await asyncio.to_thread(flush_traces, timeout_ms)
+
+
 def configure_otel(
     endpoint: str | None = None,
     service_name: str | None = None,
@@ -272,6 +369,8 @@ def configure_otel(
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
     except ImportError:
+        if endpoint or os.environ.get(_OTEL_ENDPOINT_ENV):
+            _warn_otel_missing_once()
         return False
 
     resolved_endpoint = endpoint or os.environ.get(_OTEL_ENDPOINT_ENV)

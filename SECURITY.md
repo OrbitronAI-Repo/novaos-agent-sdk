@@ -20,7 +20,7 @@ We consider security research conducted in good faith, consistent with this poli
 
 ## Supported versions
 
-Security fixes are backported to the `1.x` line described in [Versioning and support](https://orbitronai-repo.github.io/novaos-agent-sdk/versioning-and-support/) for as long as it remains the current stable line. There is no separate long-term-support commitment beyond that. `1.x` is the final ACP line and is maintained on a best-effort basis.
+Security fixes are backported to the `1.x` line described in [Versioning and support](https://orbitronai-repo.github.io/novaos-agent-sdk/versioning-and-support/) for as long as it remains the current stable line. There is no separate long-term-support commitment beyond that. `1.x` is the last line on the pre-A2A protocol and is maintained on a best-effort basis.
 
 ## Out of scope
 

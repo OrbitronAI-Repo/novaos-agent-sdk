@@ -14,13 +14,14 @@ Adapted to use httpx (already a dependency of novaos-client-sdk).
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import logging
 import os
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Literal
 
 from novaos_client_sdk import config as _config
@@ -34,9 +35,16 @@ from novaos_client_sdk._resilience import (
 from novaos_client_sdk._resilience import (
     backoff_delay as _backoff_delay,
 )
+from novaos_client_sdk.current_token import default_source
 from novaos_client_sdk.hitl_effect import MCP_TOOLS_CALL_WRITE, mcp_tool_action_class
 from novaos_client_sdk.memory import MemoryType, _check_memory_type, _recall_filters
-from novaos_client_sdk.tracing import get_traceparent, inject_trace_headers, traced_tool_call
+from novaos_client_sdk.tracing import (
+    extract_trace_id,
+    get_traceparent,
+    inject_trace_headers,
+    traced_tool_call,
+)
+from novaos_client_sdk.write_keys import idempotency_key
 
 from .agent_types import ToolResponse
 from .header_safety import filter_custom_headers
@@ -223,6 +231,91 @@ class BatchIngestResponse:
     items: list[IngestJobStatus]
 
 
+IDEMPOTENCY_KEY_HEADER = "X-Idempotency-Key"
+BUSINESS_KEY_HEADER = "X-NovaOS-Business-Key"
+
+
+class _CallKeys:
+    """Derives the ``X-Idempotency-Key`` of each write tool call of one execution.
+
+    mcp-gateway records a completed write against the run only when the call
+    carries the header. It also caches its reply to a keyed call (per tenant,
+    24 h) and answers a repeated key from that cache. It caches every reply
+    except a 503, including a ``-32042`` approval request and a 5xx failure.
+    Two schemes, one shared instance per execution:
+
+    * **Business-key scheme** (opt-in, ``use_business_key``, needs a business key): the
+      key is :func:`~novaos_client_sdk.write_keys.idempotency_key` of the business key,
+      :attr:`step` and a write counter that restarts at each step, the same function
+      AgentLoop uses. It does not depend on the execution, so it is the same after a
+      resume or a continuation that reaches the same step on the same record. Until the
+      gateway caches only completed successful replies, a continuation's write with the
+      same key would get the cached ``-32042``, so it stays off by default.
+    * **Execution-scoped scheme** (the default, and the fallback when no business key is
+      set): a hash of the execution key, the tool, its arguments (key order does not
+      matter) and how many times this exact call already ran in this execution. It only
+      protects against the platform redelivering the *same* execution (same
+      ``ctx.idempotency_key``): a write that execution repeats gets the reply of the
+      first one instead of running twice, even when unrelated calls come before it. A
+      repeated call in one execution gets a new key. A HITL continuation or a resume is
+      a new execution with new keys; what keeps a resumed run from repeating a write is
+      the run's ``committed_writes``, not this key. A retry of a failed write with the
+      same key gets the cached failure.
+
+    Reads get no key (see :meth:`_BaseToolBinding._next_call_key`), so a
+    redelivered execution re-reads current data. One instance is shared by every
+    binding of an execution.
+    """
+
+    def __init__(self, execution_key: str = "") -> None:
+        self._execution_key = execution_key
+        self._seen: dict[str, int] = {}
+        self.read_only_tools: set[str] = set()
+        self.business_key = ""
+        self.use_business_key = False
+        self._step = 0
+        self._index = 0
+        #: Keyed calls that went out without a business-key key.
+        self.writes_without_business_key = 0
+        self._warned = False
+
+    def reset(self, execution_key: str) -> None:
+        """Start over for a new execution key; the business-key settings stay."""
+        self._execution_key = execution_key
+        self._seen = {}
+
+    def set_step(self, step: int) -> None:
+        """Move to ``step`` and restart the write counter."""
+        if step < 0:
+            raise ValueError("step must not be negative")
+        self._step = step
+        self._index = 0
+
+    def next(self, tool_name: str, arguments: dict[str, Any]) -> str | None:
+        if self.use_business_key and self.business_key:
+            index = self._index
+            self._index += 1
+            return idempotency_key(self.business_key, step=self._step, index=index)
+        if not self._execution_key:
+            return None
+        self._note_no_business_key()
+        call = f"{tool_name}\x00{json.dumps(arguments, sort_keys=True, default=str)}"
+        occurrence = self._seen.get(call, 0)
+        self._seen[call] = occurrence + 1
+        raw = f"{self._execution_key}\x00{call}\x00{occurrence}".encode()
+        return hashlib.sha256(raw).hexdigest()[:32]
+
+    def _note_no_business_key(self) -> None:
+        self.writes_without_business_key += 1
+        if not self._warned:
+            self._warned = True
+            _logger.warning(
+                "tool call keyed without a business key: the key protects redelivery of "
+                "this execution only, not a resume or continuation; call "
+                "ctx.tools.set_business_key() and ctx.tools.set_business_key_idempotency(True)"
+            )
+
+
 class _BaseToolBinding:
     """Base class for all tool bindings."""
 
@@ -253,7 +346,7 @@ class _BaseToolBinding:
         self._entity_refs: list[str] = []
         # Per-request W3C traceparent injected by the Temporal worker for this run.
         # Takes priority over TRACEPARENT env-var (which is stale in fleet mode where
-        # the same pod handles sequential runs without restart). (P4-fleet F16)
+        # the same pod handles sequential runs without restart).
         self._per_request_traceparent: str = ""
         # Current run's id, set by AgentExecutionContext so tool-call spans carry
         # it as an attribute (novaos.run_id) for correlation with the platform's
@@ -262,6 +355,10 @@ class _BaseToolBinding:
         # Caller-supplied `custom_headers` for the current request, already
         # filtered by `filter_custom_headers`. Forwarded on every tool call.
         self._custom_headers: dict[str, str] = {}
+        # Set by AgentExecutionContext from `ctx.idempotency_key`. `None` (no key
+        # from the platform) sends no `X-Idempotency-Key`, as before.
+        self._call_keys: _CallKeys | None = None
+        self._business_key = ""
         # Set by AgentExecutionContext for a streaming request. `None`
         # — the default, and what every non-streaming call keeps — means "emit
         # nothing", so a skill invoked outside a streaming request behaves exactly
@@ -288,9 +385,13 @@ class _BaseToolBinding:
         Call this from AgentExecutionContext once the inbound A2A request traceparent
         is known so that outbound MCP tool calls carry the correct trace context in
         fleet mode where ``TRACEPARENT`` env var is set at pod startup and becomes
-        stale across sequential runs (P4-fleet F16).
+        stale across sequential runs.
         """
         self._per_request_traceparent = traceparent
+
+    def _bearer_token(self) -> str:
+        """The run's newest token, or the one this binding was built with."""
+        return default_source().current(self._per_request_run_id, self._token)
 
     def set_run_id(self, run_id: str) -> None:
         """Set the current run's id so tool-call spans carry it as an attribute.
@@ -309,6 +410,49 @@ class _BaseToolBinding:
         """
         self._custom_headers = filter_custom_headers(custom_headers)
 
+    def set_call_keys(self, call_keys: _CallKeys | None) -> None:
+        """Derive each tool call's ``X-Idempotency-Key`` from ``call_keys``.
+
+        Called by :meth:`ToolBindings.set_idempotency_key` with the instance it
+        shares between all bindings of one execution.
+        """
+        self._call_keys = call_keys
+
+    def set_business_key(self, business_key: str) -> None:
+        """Send ``business_key`` as ``X-NovaOS-Business-Key`` on every tool call; ``""`` stops it."""
+        self._business_key = business_key
+
+    def _next_call_key(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        read_only: bool = False,
+        idempotency_key: str | None = None,
+    ) -> str | None:
+        """The key for one logical call, taken once so every retry attempt reuses it.
+
+        A caller's ``idempotency_key`` is sent unchanged. Otherwise a read (the
+        call says so, or the tool was marked with :meth:`ToolBindings.mark_read_only`)
+        gets none; any other tool counts as a write.
+        """
+        if idempotency_key:
+            return idempotency_key
+        if self._call_keys is None:
+            return None
+        if read_only or tool_name in self._call_keys.read_only_tools:
+            return None
+        return self._call_keys.next(tool_name, arguments)
+
+    def _with_idempotency_headers(
+        self, headers: dict[str, str], call_key: str | None
+    ) -> dict[str, str]:
+        if call_key:
+            headers[IDEMPOTENCY_KEY_HEADER] = call_key
+        if self._business_key:
+            headers[BUSINESS_KEY_HEADER] = self._business_key
+        return headers
+
     def _with_custom_headers(self, headers: dict[str, str]) -> dict[str, str]:
         """Add the caller's custom headers beneath the SDK's own.
 
@@ -318,6 +462,30 @@ class _BaseToolBinding:
         headers.update(
             {name: value for name, value in self._custom_headers.items() if name not in taken}
         )
+        return headers
+
+    def _with_trace_headers(self, headers: dict[str, str], span: Any | None) -> dict[str, str]:
+        """Add the ``traceparent`` the MCP Gateway should parent its spans under.
+
+        ``span`` is this call's ``tool.<name>`` span. Its own ``traceparent``
+        (injected from the active span) is sent when it is in the same trace as
+        the per-request one, so the gateway's spans are children of the tool span
+        rather than its siblings. Otherwise the per-request ``traceparent`` wins:
+        a tool span in another trace (a call made outside the skill's span) or a
+        stale ``TRACEPARENT`` env var from pod startup in fleet mode must not pull
+        the gateway's spans out of the run's trace.
+        """
+        inject_trace_headers(headers)
+        own = headers.get("traceparent", "") if span is not None else ""
+        per_request = self._per_request_traceparent
+        if per_request:
+            run_trace = extract_trace_id(per_request)
+            if run_trace is None or extract_trace_id(own) != run_trace:
+                headers["traceparent"] = per_request
+        elif "traceparent" not in headers:
+            tp = get_traceparent()
+            if tp:
+                headers["traceparent"] = tp
         return headers
 
     def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
@@ -331,6 +499,8 @@ class _BaseToolBinding:
         arguments: dict[str, Any],
         *,
         timeout_s: int | None = None,
+        read_only: bool = False,
+        idempotency_key: str | None = None,
     ) -> ToolResponse:
         """Make a governed MCP tool call with auto-injected auth.
 
@@ -344,7 +514,14 @@ class _BaseToolBinding:
         how) even when it failed.
         """
         self._emit_event("tool.call", {"tool_name": tool_name, "arguments": arguments})
-        resp = await self._call_tool_impl(tool_name, arguments, timeout_s=timeout_s)
+        resp = await self._call_tool_impl(
+            tool_name,
+            arguments,
+            timeout_s=timeout_s,
+            call_key=self._next_call_key(
+                tool_name, arguments, read_only=read_only, idempotency_key=idempotency_key
+            ),
+        )
         self._emit_event(
             "tool.result",
             {
@@ -362,6 +539,7 @@ class _BaseToolBinding:
         arguments: dict[str, Any],
         *,
         timeout_s: int | None = None,
+        call_key: str | None = None,
     ) -> ToolResponse:
         """Make a governed MCP tool call with auto-injected auth.
 
@@ -383,29 +561,20 @@ class _BaseToolBinding:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": f"Bearer {self._bearer_token()}",
             "X-Tenant-ID": self._tenant_id,
         }
 
         if self._entity_refs:
             headers["X-NovaOS-Entity-Refs"] = json.dumps(self._entity_refs)
+        self._with_idempotency_headers(headers, call_key)
         self._with_custom_headers(headers)
 
         effective_timeout = timeout_s if timeout_s is not None else self._default_timeout_s
         _config.validate_tool_timeout(effective_timeout, self._gateway_timeout_s)
         start = time.perf_counter()
         with traced_tool_call(tool_name, arguments, run_id=self._per_request_run_id) as span:
-            # Inject W3C traceparent from the active span (or env fallback) so the
-            # MCP Gateway can link child HTTP spans to this tool span.
-            inject_trace_headers(headers)
-            # Per-request traceparent ALWAYS wins over whatever inject_trace_headers set
-            # (which may be a stale TRACEPARENT env var from pod startup in fleet mode).
-            if self._per_request_traceparent:
-                headers["traceparent"] = self._per_request_traceparent
-            elif "traceparent" not in headers:
-                tp = get_traceparent()
-                if tp:
-                    headers["traceparent"] = tp
+            self._with_trace_headers(headers, span)
 
             try:
                 async with httpx.AsyncClient(timeout=effective_timeout) as client:
@@ -458,6 +627,7 @@ class _BaseToolBinding:
         max_retries: int = 3,
         base_delay_s: float = 1.0,
         circuit_breaker: "CircuitBreaker | None" = None,
+        read_only: bool = False,
     ) -> ToolResponse:
         """Like :meth:`_call_tool` but with exponential backoff and circuit breaker.
 
@@ -488,6 +658,7 @@ class _BaseToolBinding:
             max_retries=max_retries,
             base_delay_s=base_delay_s,
             circuit_breaker=circuit_breaker,
+            call_key=self._next_call_key(tool_name, arguments, read_only=read_only),
         )
         self._emit_event(
             "tool.result",
@@ -509,6 +680,7 @@ class _BaseToolBinding:
         max_retries: int = 3,
         base_delay_s: float = 1.0,
         circuit_breaker: "CircuitBreaker | None" = None,
+        call_key: str | None = None,
     ) -> ToolResponse:
         """Retry/circuit-breaker implementation behind :meth:`_call_tool_with_retry`.
 
@@ -553,21 +725,14 @@ class _BaseToolBinding:
                 headers: dict[str, str] = {
                     "Content-Type": "application/json",
                     "Accept": "application/json",
-                    "Authorization": f"Bearer {self._token}",
+                    "Authorization": f"Bearer {self._bearer_token()}",
                     "X-Tenant-ID": self._tenant_id,
                 }
                 if self._entity_refs:
                     headers["X-NovaOS-Entity-Refs"] = json.dumps(self._entity_refs)
+                self._with_idempotency_headers(headers, call_key)
                 self._with_custom_headers(headers)
-                inject_trace_headers(headers)
-                # Per-request traceparent ALWAYS wins over whatever inject_trace_headers set
-                # (which may be a stale TRACEPARENT env var from pod startup in fleet mode).
-                if self._per_request_traceparent:
-                    headers["traceparent"] = self._per_request_traceparent
-                elif "traceparent" not in headers:
-                    tp = get_traceparent()
-                    if tp:
-                        headers["traceparent"] = tp
+                self._with_trace_headers(headers, span)
 
                 attempt_start = time.perf_counter()
                 try:
@@ -744,6 +909,10 @@ class _BaseToolBinding:
         If you find yourself reaching for this repeatedly for the same tool,
         that's a signal the SDK should grow a first-class binding for it —
         please file that gap rather than normalizing this path.
+
+        A tool on an MCP server the agent declares in its manifest is not a
+        bypass: call it with ``ctx.tools.connectors.call_mcp_tool`` instead,
+        which does not warn.
         """
         _logger.warning(
             "call_ungoverned_tool(%r): bypassing the governed ToolBindings surface. "
@@ -852,11 +1021,43 @@ class KnowledgeTool(_BaseToolBinding):
         limit: int = 5,
         collection: str | None = None,
         *,
+        collection_ids: list[str] | None = None,
+        scope: Literal["single", "tenant_visible"] | None = None,
         timeout_s: int | None = None,
     ) -> ToolResponse:
+        """Search the knowledge base without generating an answer.
+
+        Name the collection(s) to search; the service requires one of:
+
+        * ``collection`` — one collection (UUID or slug).
+        * ``collection_ids`` — several collections in one call, ranked together.
+          Each is access-checked; a collection that fails to search is left out
+          and the call returns ``degraded=True``. An unknown id fails the call.
+        * ``scope="tenant_visible"`` — every collection the caller can read.
+          Cannot be combined with ``collection_ids``.
+
+        Hits from a multi-collection search carry ``metadata.collection_id``.
+        Omitting all three does not search everything; the service rejects the
+        call.
+
+        Raises:
+            ValueError: ``scope`` is not ``"single"`` or ``"tenant_visible"``,
+                ``collection_ids`` is empty, or it is combined with
+                ``scope="tenant_visible"``. Nothing is sent.
+        """
+        if scope is not None and scope not in ("single", "tenant_visible"):
+            raise ValueError(f"scope must be 'single' or 'tenant_visible'; got {scope!r}")
+        if collection_ids is not None and not collection_ids:
+            raise ValueError("collection_ids must not be empty")
+        if collection_ids and scope == "tenant_visible":
+            raise ValueError("collection_ids cannot be combined with scope='tenant_visible'")
         args: dict[str, Any] = {"query": query, "limit": limit}
         if collection:
             args["collection"] = collection
+        if collection_ids:
+            args["collection_ids"] = list(collection_ids)
+        if scope:
+            args["scope"] = scope
         return await self._call_tool_with_retry(
             "novaos.knowledge.search",
             args,
@@ -864,6 +1065,7 @@ class KnowledgeTool(_BaseToolBinding):
             max_retries=self._max_retries,
             base_delay_s=self._base_delay_s,
             circuit_breaker=self._circuit_breaker,
+            read_only=True,
         )
 
     async def ingest(
@@ -919,6 +1121,7 @@ class KnowledgeTool(_BaseToolBinding):
             max_retries=self._max_retries,
             base_delay_s=self._base_delay_s,
             circuit_breaker=self._circuit_breaker,
+            read_only=True,
         )
         if resp.success:
             return ToolResponse(success=True, data=_unwrap_mcp_content(resp.data))
@@ -1017,6 +1220,7 @@ class KnowledgeTool(_BaseToolBinding):
             max_retries=self._max_retries,
             base_delay_s=self._base_delay_s,
             circuit_breaker=self._circuit_breaker,
+            read_only=True,
         )
         if resp.success:
             return ToolResponse(success=True, data=_unwrap_mcp_content(resp.data))
@@ -1078,6 +1282,7 @@ class KnowledgeTool(_BaseToolBinding):
             max_retries=self._max_retries,
             base_delay_s=self._base_delay_s,
             circuit_breaker=self._circuit_breaker,
+            read_only=True,
         )
         if resp.success:
             return ToolResponse(success=True, data=_unwrap_mcp_content(resp.data))
@@ -1100,6 +1305,7 @@ class KnowledgeTool(_BaseToolBinding):
             max_retries=self._max_retries,
             base_delay_s=self._base_delay_s,
             circuit_breaker=self._circuit_breaker,
+            read_only=True,
         )
         if resp.success:
             return ToolResponse(success=True, data=_unwrap_mcp_content(resp.data))
@@ -1323,7 +1529,7 @@ class AgentsTool(_BaseToolBinding):
         args: dict[str, Any] = {}
         if query:
             args["query"] = query
-        return await self._call_tool("novaos.agents.discover", args)
+        return await self._call_tool("novaos.agents.discover", args, read_only=True)
 
 
 _HITL_REQUEST_INPUT_UNAVAILABLE = (
@@ -1403,7 +1609,7 @@ class FilesTool(_BaseToolBinding):
 
     async def download(self, file_id: str, *, timeout_s: int | None = None) -> ToolResponse:
         return await self._call_tool(
-            "novaos.files.download", {"file_id": file_id}, timeout_s=timeout_s
+            "novaos.files.download", {"file_id": file_id}, timeout_s=timeout_s, read_only=True
         )
 
     async def list(
@@ -1412,7 +1618,7 @@ class FilesTool(_BaseToolBinding):
         args: dict[str, Any] = {}
         if prefix:
             args["prefix"] = prefix
-        return await self._call_tool("novaos.files.list", args, timeout_s=timeout_s)
+        return await self._call_tool("novaos.files.list", args, timeout_s=timeout_s, read_only=True)
 
 
 class MemoryTool(_BaseToolBinding):
@@ -1475,7 +1681,9 @@ class MemoryTool(_BaseToolBinding):
         recall_filters = _recall_filters(filters, memory_type, conversation_id)
         if recall_filters:
             args["filters"] = recall_filters
-        return await self._call_tool("novaos.memory.query", args, timeout_s=timeout_s)
+        return await self._call_tool(
+            "novaos.memory.query", args, timeout_s=timeout_s, read_only=True
+        )
 
     async def update(
         self,
@@ -1541,14 +1749,17 @@ class MemoryTool(_BaseToolBinding):
 
     async def hint_status(self, hint_id: str, *, timeout_s: int | None = None) -> ToolResponse:
         return await self._call_tool(
-            "novaos.memory.hint_status", {"hint_id": hint_id}, timeout_s=timeout_s
+            "novaos.memory.hint_status", {"hint_id": hint_id}, timeout_s=timeout_s, read_only=True
         )
 
     async def proposal_status(
         self, proposal_id: str, *, timeout_s: int | None = None
     ) -> ToolResponse:
         return await self._call_tool(
-            "novaos.memory.proposal_status", {"proposal_id": proposal_id}, timeout_s=timeout_s
+            "novaos.memory.proposal_status",
+            {"proposal_id": proposal_id},
+            timeout_s=timeout_s,
+            read_only=True,
         )
 
     async def assemble(
@@ -1572,7 +1783,9 @@ class MemoryTool(_BaseToolBinding):
         recall_filters = _recall_filters(None, memory_type, conversation_id)
         if recall_filters:
             args["filters"] = recall_filters
-        return await self._call_tool("novaos.memory.assemble", args, timeout_s=timeout_s)
+        return await self._call_tool(
+            "novaos.memory.assemble", args, timeout_s=timeout_s, read_only=True
+        )
 
 
 class NotifyTool(_BaseToolBinding):
@@ -1620,11 +1833,13 @@ class BrowserTool(_BaseToolBinding):
         return await self._call_tool("novaos.browser.navigate", {"url": url}, timeout_s=timeout_s)
 
     async def screenshot(self, *, timeout_s: int | None = None) -> ToolResponse:
-        return await self._call_tool("novaos.browser.screenshot", {}, timeout_s=timeout_s)
+        return await self._call_tool(
+            "novaos.browser.screenshot", {}, timeout_s=timeout_s, read_only=True
+        )
 
     async def extract(self, selector: str, *, timeout_s: int | None = None) -> ToolResponse:
         return await self._call_tool(
-            "novaos.browser.extract", {"selector": selector}, timeout_s=timeout_s
+            "novaos.browser.extract", {"selector": selector}, timeout_s=timeout_s, read_only=True
         )
 
 
@@ -1702,8 +1917,16 @@ class ConnectorTool(_BaseToolBinding):
         tier: Literal["standard", "licensed", "ext"] = "standard",
         params_schema: dict[str, Any] | None = None,
         timeout_s: int | None = None,
+        read_only: bool = False,
+        idempotency_key: str | None = None,
     ) -> ToolResponse:
         """Invoke ``operation`` on ``connector_id`` with ``params``.
+
+        ``read_only=True`` says the call only reads, so it is sent without an
+        ``X-Idempotency-Key`` and a redelivered execution reads current data; a
+        tool the SDK cannot tell is a read counts as a write (see
+        :meth:`ToolBindings.mark_read_only`). ``idempotency_key`` is sent unchanged
+        instead of the key the SDK derives, e.g. by a loop with its own key scheme.
 
         Calls the MCP tool ``novaos.connector.{connector_id}.{operation}`` (or,
         for ``tier="licensed"``/``tier="ext"``, the same name with that tier
@@ -1784,7 +2007,13 @@ class ConnectorTool(_BaseToolBinding):
                 return ToolResponse(success=False, error="; ".join(schema_errors))
 
         fqn = _connector_fqn(connector_id, operation, tier)
-        resp = await self._call_tool(fqn, params, timeout_s=timeout_s)
+        resp = await self._call_tool(
+            fqn,
+            params,
+            timeout_s=timeout_s,
+            read_only=read_only,
+            idempotency_key=idempotency_key,
+        )
         if resp.success:
             return ToolResponse(success=True, data=_unwrap_mcp_content(resp.data))
         if (
@@ -1806,6 +2035,63 @@ class ConnectorTool(_BaseToolBinding):
                 ),
             )
         return resp
+
+    async def call_mcp_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: int | None = None,
+        read_only: bool = False,
+        idempotency_key: str | None = None,
+    ) -> ToolResponse:
+        """Call a tool on one of the agent's own MCP servers.
+
+        ``read_only=True`` says the call only reads, so it is sent without an
+        ``X-Idempotency-Key`` and a redelivered execution reads current data; a
+        tool the SDK cannot tell is a read counts as a write (see
+        :meth:`ToolBindings.mark_read_only`). ``idempotency_key`` is sent unchanged
+        instead of the key the SDK derives, e.g. by a loop with its own key scheme.
+
+        For the servers an agent declares as MCP dependencies in its manifest,
+        e.g. ``acme.reorder-calculator.get_reorder_qty``
+        (``<publisher>.<server>.<tool>``). It goes through the same MCP Gateway
+        path as every other binding, so the Gateway still enforces the
+        agent's entitlements, and the call produces the same tool events. Unlike
+        :meth:`call_ungoverned_tool` it does not warn, because a declared server
+        is not a bypass.
+
+        The SDK does not read the manifest, so it cannot check that the server is
+        declared; the Gateway does. What it does check is that the name is not
+        one of the platform's own tools (``novaos.*``): those have governed
+        bindings — ``ctx.tools.knowledge``, ``ctx.tools.memory``, ... — and this
+        method will not reach them. Use :meth:`call_ungoverned_tool` for a tool
+        that has no declared server.
+
+        Uses the plain (non-retrying) call path: an arbitrary tool's idempotency
+        cannot be assumed.
+
+        Raises:
+            ValueError: ``tool_name`` is not ``<publisher>.<server>.<tool>``, or
+                names a platform (``novaos.*``) tool. Nothing is sent.
+        """
+        parts = tool_name.split(".")
+        if len(parts) < 3 or not all(parts):
+            raise ValueError(
+                f"tool_name must look like '<publisher>.<server>.<tool>'; got {tool_name!r}"
+            )
+        if parts[0] == "novaos":
+            raise ValueError(
+                f"{tool_name!r} is a platform tool; use its governed binding "
+                "(ctx.tools.knowledge, ctx.tools.memory, ...) instead of call_mcp_tool"
+            )
+        return await self._call_tool(
+            tool_name,
+            arguments,
+            timeout_s=timeout_s,
+            read_only=read_only,
+            idempotency_key=idempotency_key,
+        )
 
 
 class ToolBindings:
@@ -1905,6 +2191,21 @@ class ToolBindings:
             default_timeout_s=default_timeout_s,
             gateway_timeout_s=gateway_timeout_s,
         )
+        # One instance shared by every binding, so the write counter is per execution.
+        self._call_keys = _CallKeys()
+        for tool in (
+            self.knowledge,
+            self.agents,
+            self.hitl,
+            self.files,
+            self.memory,
+            self.notify,
+            self.http,
+            self.browser,
+            self.code,
+            self.connectors,
+        ):
+            tool.set_call_keys(self._call_keys)
 
     def set_entity_refs(self, refs: list[str]) -> None:
         for tool in (
@@ -1945,7 +2246,7 @@ class ToolBindings:
             tool.set_event_sink(sink)
 
     def set_traceparent(self, traceparent: str) -> None:
-        """Set a per-request W3C traceparent on all tool bindings (P4-fleet F16).
+        """Set a per-request W3C traceparent on all tool bindings.
 
         In fleet mode the same pod handles sequential runs, so ``TRACEPARENT`` env
         var is stale after the first run.  Call this once per request with the
@@ -1986,6 +2287,84 @@ class ToolBindings:
             self.connectors,
         ):
             tool.set_run_id(run_id)
+
+    def set_idempotency_key(self, idempotency_key: str) -> None:
+        """Send an ``X-Idempotency-Key`` derived from ``idempotency_key`` on every tool call.
+
+        Called once per request by ``AgentExecutionContext`` with
+        ``ctx.idempotency_key``; see :class:`_CallKeys` for how each call's key is
+        derived. An empty key (the platform sent none) sends no header, unless the
+        business-key scheme is on (see :meth:`set_business_key_idempotency`).
+        """
+        self._call_keys.reset(idempotency_key)
+
+    def mark_read_only(self, tool_names: Iterable[str]) -> None:
+        """Send no ``X-Idempotency-Key`` on calls to these tools, which only read.
+
+        Pass the names ``tools/list`` annotates ``readOnlyHint: true``
+        (:attr:`MCPTool.read_only <novaos_client_sdk.mcp.MCPTool.read_only>`).
+        A redelivered execution then reads current data instead of the reply
+        cached for the first read. Any tool not marked counts as a write. The
+        SDK's own reads (``knowledge.search``, ``memory.query``, ...) need no
+        marking.
+        """
+        self._call_keys.read_only_tools.update(tool_names)
+
+    def set_business_key(self, business_key: str) -> None:
+        """Send ``business_key`` as ``X-NovaOS-Business-Key`` on every tool call of every binding.
+
+        The platform stores it with each completed write of the run, so a resumed
+        run can find the writes made for one business record (an order, a
+        supplier). Pass ``""`` to stop sending it. The business-key write scheme also
+        reads it; see :meth:`set_business_key_idempotency`.
+        """
+        self._call_keys.business_key = business_key
+        for tool in (
+            self.knowledge,
+            self.agents,
+            self.hitl,
+            self.files,
+            self.memory,
+            self.notify,
+            self.http,
+            self.browser,
+            self.code,
+            self.connectors,
+        ):
+            tool.set_business_key(business_key)
+
+    def set_business_key_idempotency(self, enabled: bool = True) -> None:
+        """Opt in to write keys built from the business key and the step.
+
+        Off by default. When on and a business key is set, each call's
+        ``X-Idempotency-Key`` is ``idempotency_key(business_key, step=..., index=...)``,
+        the function AgentLoop uses, so it does not change across a resume, a HITL
+        continuation or a redelivery that reaches the same step on the same record. With
+        no business key the execution-scoped key is sent instead, which protects
+        redelivery of one execution only.
+
+        Turn it on only when mcp-gateway caches just completed successful replies per
+        key. Until then a continuation's write would be answered with the cached
+        approval request, because the key is the same as the call that asked for it.
+        """
+        self._call_keys.use_business_key = enabled
+
+    def set_step(self, step: int) -> None:
+        """Set the step the business-key scheme keys writes under; restarts the write counter.
+
+        A caller outside AgentLoop has no model step, so the step is whatever phase of the
+        work the caller names (default 0). A write is keyed by its position in its step: the
+        counter counts keyed calls through every binding, and a step is one stretch of an
+        execution that makes the same writes in the same order whenever it is reached. Give a
+        continuation a step no earlier execution of the same record used; the same step and
+        position is the same write.
+        """
+        self._call_keys.set_step(step)
+
+    @property
+    def writes_without_business_key(self) -> int:
+        """Calls keyed without a business-key key in this execution (logged once as a warning)."""
+        return self._call_keys.writes_without_business_key
 
     def set_custom_headers(self, custom_headers: Mapping[str, str]) -> None:
         """Forward the caller's ``custom_headers`` on every tool call of every binding.

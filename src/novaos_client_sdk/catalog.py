@@ -31,8 +31,9 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_retry_after
 from novaos_client_sdk.a2a_agent_card import AgentCard
-from novaos_client_sdk.discovery import _parsed_card, _retry_after
+from novaos_client_sdk.discovery import _parsed_card
 from novaos_client_sdk.exceptions import (
     NovaOSAuthenticationError,
     NovaOSConnectionError,
@@ -180,7 +181,7 @@ class AgentCatalogClient:
         if status == 429:
             return NovaOSRateLimitError(
                 "Agent catalog rate limit exceeded",
-                retry_after=_retry_after(error.response),
+                retry_after=status_error_retry_after(error),
                 details=details,
             )
         if status >= 500:

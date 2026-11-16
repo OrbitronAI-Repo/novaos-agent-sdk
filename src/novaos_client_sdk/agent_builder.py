@@ -203,8 +203,10 @@ from .exceptions import (
     UnsupportedOperationError,
     VersionNotSupportedError,
 )
+from .logging import install_structured_root_logging
 from .pii import mask_pii, mask_pii_in_dict
-from .tracing import _HAS_OTEL, _get_tracer
+from .run_context import RunContext, bind_run, plan_id_from_token, reset_run
+from .tracing import _HAS_OTEL, _get_tracer, aflush_traces, context_from_traceparent
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +364,21 @@ _PUSH_NOTIFICATION_CONFIG_METHODS: frozenset[str] = frozenset(
         METHOD_DELETE_TASK_PUSH_NOTIFICATION_CONFIG,
     }
 )
+
+
+def _raised_by(skill_task: "asyncio.Task[Any] | None", error: BaseException) -> bool:
+    """Whether ``error`` is the exception ``skill_task`` itself ended with.
+
+    Such an error was already logged, with the run's ids, by
+    :meth:`AgentBuilder._call_handler`; one raised around the skill (storing
+    its outcome, say) was not.
+    """
+    return (
+        skill_task is not None
+        and skill_task.done()
+        and not skill_task.cancelled()
+        and skill_task.exception() is error
+    )
 
 
 def _is_nonempty_str(value: Any) -> bool:
@@ -538,6 +555,7 @@ async def _maybe_prefetch_memory(ctx: AgentExecutionContext, input_text: str) ->
         return
 
     ctx.memory.context = result
+    ctx.memory.context_query = input_text
     ctx._emit_platform_event(
         "memory.assembled",
         {
@@ -752,6 +770,7 @@ class AgentBuilder:
         tags: Iterable[str] | None = None,
         input_modes: Iterable[str] | None = None,
         output_modes: Iterable[str] | None = None,
+        examples: Iterable[str] | None = None,
     ) -> Callable:
         """Register a skill handler.
 
@@ -773,7 +792,17 @@ class AgentBuilder:
                 ``AgentSkill.inputModes``.
             output_modes: Media types this skill produces, for
                 ``AgentSkill.outputModes``.
+            examples: Example prompts for this skill, for ``AgentSkill.examples``.
+                They are carried through to the Agent Card
+                :meth:`to_agent_card` builds, which is where a caller reads
+                the input format a skill expects (for example
+                ``["Summarise ticket 1234"]``), so write them as the exact
+                text a caller would send.
         """
+        if isinstance(examples, str):
+            # A bare string is iterable, so it would land on the card one
+            # character per example.
+            raise TypeError("examples must be a list of strings, not a single string")
 
         def decorator(func: Callable) -> Callable:
             skill_id = id if id is not None else name
@@ -784,6 +813,7 @@ class AgentBuilder:
                 "tags": list(tags) if tags is not None else [],
                 "input_modes": list(input_modes) if input_modes is not None else [],
                 "output_modes": list(output_modes) if output_modes is not None else [],
+                "examples": list(examples) if examples is not None else [],
             }
             return func
 
@@ -955,6 +985,7 @@ class AgentBuilder:
                     name=meta.get("name") or skill_id,
                     description=meta.get("description") or "",
                     tags=list(meta.get("tags") or ()),
+                    examples=list(meta.get("examples") or ()),
                     input_modes=list(meta.get("input_modes") or ()),
                     output_modes=self._supported_output_modes(
                         skill_id, default_output_modes=effective_default_output_modes
@@ -1347,6 +1378,24 @@ class AgentBuilder:
         first, rather than only catching the terminal call's own
         ``RuntimeError`` afterward, is what lets this method skip the
         artifact loop too instead of just the status write.
+
+        **A pause the skill already published wins too.** The same
+        precedence applies to a non-terminal pause: a skill that called
+        ``ctx.task_updater.requires_input(message)`` (or ``requires_auth``)
+        and then returns the matching ``WAITING_USER``/``AUTH_REQUIRED``
+        status has already said how its task pauses, and ``message`` here —
+        rebuilt from ``SkillResult.output`` — is the less specific of the two.
+        Re-publishing it used to replace the skill's own status message, and
+        with it the HITL payload the platform reads from the paused task's
+        last status message (``pending_tool``, which the approval's
+        ``hitl_approved`` claim is bound to), so a gated write could never be
+        approved (CU-z95t6g856h). The status write is therefore skipped when
+        the last write through ``updater`` already set ``state``; artifacts are
+        still attached. A pause from a *different* state than the one the
+        skill returns — say, it paused and then finished anyway — is not
+        matched and the returned status is published as before. On the
+        non-streaming path this also means the pause carries the skill's
+        message instead of one folding in ``buffered_events``.
         """
         if updater.is_sealed:
             return
@@ -1358,6 +1407,8 @@ class AgentBuilder:
                 description=artifact.description,
                 last_chunk=True,
             )
+        if state in INTERRUPT_TASK_STATES and updater.last_written_state == state:
+            return
         try:
             if state == TaskState.REJECTED:
                 await updater.reject(message)
@@ -1386,7 +1437,9 @@ class AgentBuilder:
             # well-formed request, which is worse than a redundant guard.
             pass
 
-    def _failed_message(self, error: BaseException, *, task_id: str, context_id: str) -> A2AMessage:
+    def _failed_message(
+        self, error: BaseException, *, task_id: str, context_id: str, logged: bool = False
+    ) -> A2AMessage:
         """The ``FAILED`` status message for a skill that raised ``error``.
 
         One place for the PII-masking rule every failure path shares —
@@ -1395,16 +1448,21 @@ class AgentBuilder:
         exception the same way, and ``mask_output_pii`` must apply to all
         three or the flag's promise ("agent output never carries a PII
         pattern") has a hole in it on whichever path forgot.
+
+        ``logged`` says :meth:`_call_handler` already logged ``error`` with the
+        run's ids (see :func:`_raised_by`); only an error raised outside the
+        skill itself is logged here.
         """
         error_message = describe_exception(error)
-        logger.error(
-            "skill raised %s; reporting FAILED for task %s",
-            type(error).__qualname__,
-            task_id,
-            # The traceback carries the exception message, which the masking flag
-            # promises never leaves the pod unmasked.
-            exc_info=None if self._mask_output_pii else error,
-        )
+        if not logged:
+            logger.error(
+                "skill raised %s; reporting FAILED for task %s",
+                type(error).__qualname__,
+                task_id,
+                # The traceback carries the exception message, which the masking flag
+                # promises never leaves the pod unmasked.
+                exc_info=None if self._mask_output_pii else error,
+            )
         if self._mask_output_pii:
             error_message = mask_pii(error_message) or error_message
         return self._agent_message(
@@ -1412,6 +1470,137 @@ class AgentBuilder:
             task_id=task_id,
             context_id=context_id,
         )
+
+    async def _run_skill(
+        self,
+        handler: Callable[..., Any],
+        ctx: AgentExecutionContext,
+        input_text: str,
+        *,
+        skill_name: str,
+        task_id: str,
+    ) -> SkillResult:
+        """Run ``handler`` as the run's ``skill.<name>`` span.
+
+        This is the body of the skill's own ``Task`` on every path —
+        :meth:`_send_message`, :meth:`_stream_send_message`, and a detached
+        execution, whose finisher awaits that same ``Task`` — so the span lives
+        as long as the skill does, not as long as the request that started it.
+        It is started inside the task's context, so it is the current span for
+        everything the skill starts (LLM calls, ``ctx.tools``, ``AgentLoop``
+        nodes) and those nest under it. It joins the caller's trace through
+        ``ctx.traceparent``; without one, or without OpenTelemetry, it is a root,
+        as before.
+
+        A raised exception or a ``FAILED`` result marks the span ``ERROR``; a
+        cancellation (a ``CancelTask``, or the skill giving up) does not. Spans
+        are flushed once the skill ends, before the request awaiting it can
+        answer, because the pod may be torn down right after the response.
+
+        The run's identity is bound for the same stretch (:func:`bind_run`), so
+        every log line written during the skill, through any logger, carries the
+        run's ids (see :func:`install_structured_root_logging`, installed here
+        on the first run).
+        """
+        install_structured_root_logging()
+        run_token = bind_run(
+            RunContext(
+                run_id=ctx.run_id,
+                trace_id=ctx.trace_id,
+                # The same mapping `ctx.logger` uses: there is no separate agent id.
+                agent_id=ctx.instance_id,
+                tenant_id=ctx.tenant_id,
+                instance_id=ctx.instance_id,
+                traceparent=ctx.traceparent,
+                task_id=task_id,
+                plan_id=plan_id_from_token(ctx.runtime_context.execution_token),
+            )
+        )
+        try:
+            return await self._traced_call_handler(
+                handler, ctx, input_text, skill_name=skill_name, task_id=task_id
+            )
+        finally:
+            reset_run(run_token)
+
+    async def _traced_call_handler(
+        self,
+        handler: Callable[..., Any],
+        ctx: AgentExecutionContext,
+        input_text: str,
+        *,
+        skill_name: str,
+        task_id: str,
+    ) -> SkillResult:
+        """:meth:`_call_handler` inside the ``skill.<name>`` span (see :meth:`_run_skill`)."""
+        tracer = _get_tracer() if _HAS_OTEL else None
+        if tracer is None:
+            return await self._call_handler(handler, ctx, input_text, skill_name=skill_name)
+
+        try:
+            with tracer.start_as_current_span(
+                f"skill.{skill_name}",
+                # Join the run's trace (the caller's `traceparent`) rather than
+                # start a new one; `None` — no header — keeps the span a root.
+                context=context_from_traceparent(ctx.traceparent),
+                attributes={
+                    "novaos.agent.name": self.name,
+                    "novaos.agent.version": self.version,
+                    "novaos.skill.name": skill_name,
+                    "novaos.run_id": ctx.run_id,
+                    "novaos.a2a.task_id": task_id,
+                },
+                # Recorded by hand below, so an exception is recorded once and
+                # a cancellation is never reported as an error.
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as span:
+                return await self._call_handler(
+                    handler, ctx, input_text, skill_name=skill_name, span=span
+                )
+        finally:
+            # Bounded, and off the event loop, so an unreachable collector
+            # cannot hold the response up.
+            await aflush_traces()
+
+    @staticmethod
+    async def _call_handler(
+        handler: Callable[..., Any],
+        ctx: AgentExecutionContext,
+        input_text: str,
+        *,
+        skill_name: str,
+        span: Any | None = None,
+    ) -> SkillResult:
+        """Await ``handler``; log what it raises and mark ``span`` with the outcome.
+
+        A raised exception is logged here, inside the run and its span, through
+        ``ctx.logger``: one JSON line carrying the run's ids and the traceback,
+        so ``agent logs --run-id`` shows it. ``ctx.logger`` masks PII in both.
+        :meth:`_failed_message` then leaves it out of its own log.
+        """
+        try:
+            result: SkillResult = await handler(ctx, input_text)
+        except Exception as e:
+            ctx.logger.error("skill %s raised %s", skill_name, type(e).__qualname__, exc_info=e)
+            if span is not None:
+                from opentelemetry.trace import StatusCode
+
+                span.set_status(StatusCode.ERROR, str(e))
+                span.record_exception(e)
+            raise
+        if span is not None:
+            from opentelemetry.trace import StatusCode
+
+            # An unknown status fails the task (`_task_state_for`), so it fails
+            # the span too.
+            state = _SKILL_STATUS_TO_TASK_STATE.get(
+                str(getattr(result, "status", "")), TaskState.FAILED
+            )
+            span.set_attribute("novaos.a2a.task_state", str(state))
+            if state is TaskState.FAILED:
+                span.set_status(StatusCode.ERROR, getattr(result, "error", None) or "FAILED")
+        return result
 
     async def _canceled_snapshot(self, task_updater: TaskUpdater, task_id: str) -> Task:
         """The task as a caller whose ``CancelTask`` was honoured should see it.
@@ -1621,7 +1810,7 @@ class AgentBuilder:
                 await self._finalize_task(
                     task_updater,
                     TaskState.FAILED,
-                    self._failed_message(e, task_id=task_id, context_id=context_id),
+                    self._failed_message(e, task_id=task_id, context_id=context_id, logged=True),
                     artifacts=[],
                 )
                 return
@@ -3109,7 +3298,10 @@ class AgentBuilder:
             # generator resuming from the `await`/`yield` points in the loop
             # below — abandonment mid-skill included.
             skill_context = contextvars.copy_context()
-            skill_task = asyncio.create_task(handler(ctx, input_text), context=skill_context)
+            skill_task = asyncio.create_task(
+                self._run_skill(handler, ctx, input_text, skill_name=skill_name, task_id=task_id),
+                context=skill_context,
+            )
             # Lets `_dispatch_cancel_task` reach this exact task
             # through `cancellation` even though it lives in a different
             # request's coroutine.
@@ -3240,7 +3432,9 @@ class AgentBuilder:
                     yield status_frame(canceled.status.state, canceled.status.message)
                     return
 
-                failed_message = self._failed_message(e, task_id=task_id, context_id=context_id)
+                failed_message = self._failed_message(
+                    e, task_id=task_id, context_id=context_id, logged=_raised_by(skill_task, e)
+                )
                 await self._finalize_task(
                     task_updater, TaskState.FAILED, failed_message, artifacts=[]
                 )
@@ -3740,8 +3934,6 @@ class AgentBuilder:
             )
             ctx_token = _set_eval_context(eval_ctx)
 
-        tracer = _get_tracer() if _HAS_OTEL else None
-
         # Bound outside `_execute_skill` so the abandonment
         # handler (`except BaseException` below) can hand a still-running
         # skill to `_detach_execution`; `published` flips once this call has
@@ -3765,7 +3957,10 @@ class AgentBuilder:
             # confined to the throwaway copy `asyncio.create_task` would
             # otherwise give it by default.
             skill_context = contextvars.copy_context()
-            skill_task = asyncio.create_task(handler(ctx, input_text), context=skill_context)
+            skill_task = asyncio.create_task(
+                self._run_skill(handler, ctx, input_text, skill_name=skill_name, task_id=task_id),
+                context=skill_context,
+            )
             # Lets `_dispatch_cancel_task` reach this exact task through
             # `cancellation` even though it lives in a different request's
             # coroutine.
@@ -3887,30 +4082,9 @@ class AgentBuilder:
                 canceled = await self._canceled_snapshot(task_updater, task_id)
                 return _send_message_response(canceled.to_dict())
 
-            if tracer is not None:
-                with tracer.start_as_current_span(
-                    f"skill.{skill_name}",
-                    attributes={
-                        "novaos.agent.name": self.name,
-                        "novaos.agent.version": self.version,
-                        "novaos.skill.name": skill_name,
-                        "novaos.run_id": ctx.run_id,
-                        "novaos.a2a.task_id": task_id,
-                    },
-                ) as span:
-                    try:
-                        task = await _execute_skill()
-                        span.set_attribute("novaos.a2a.task_state", task["status"]["state"])
-                        return _send_message_response(task)
-                    except Exception as e:
-                        if _HAS_OTEL:
-                            from opentelemetry.trace import StatusCode
-
-                            span.set_status(StatusCode.ERROR, str(e))
-                            span.record_exception(e)
-                        raise
-            else:
-                return _send_message_response(await _execute_skill())
+            # The `skill.<name>` span and the flush live in `_run_skill`, the
+            # skill task's own body, shared with `_stream_send_message`.
+            return _send_message_response(await _execute_skill())
         except Exception as e:
             # A plain (non-`CancelledError`)
             # exception from the skill — including one caused *by* being
@@ -3932,7 +4106,9 @@ class AgentBuilder:
                     message=str(e),
                     recoverable=False,
                 )
-            failed_message = self._failed_message(e, task_id=task_id, context_id=context_id)
+            failed_message = self._failed_message(
+                e, task_id=task_id, context_id=context_id, logged=_raised_by(skill_task, e)
+            )
             await self._finalize_task(task_updater, TaskState.FAILED, failed_message, artifacts=[])
             published = True
             # Read back what `_finalize_task`

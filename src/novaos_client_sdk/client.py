@@ -26,7 +26,7 @@ ACP                    A2A
 The four bottom rows are the capability A2A adds: an ACP run was fire-and-read,
 with no way to re-query it, reconnect to it, stop it, or enumerate what an agent
 is working on.  ``list_tasks`` in particular was missing from the migration's
-original method list entirely until ADR finding **F13** caught it.
+original method list entirely until it was caught in review.
 
 **There is no ``agent=`` parameter any more, and that is the protocol, not a
 simplification.**  ACP's ``POST /runs`` carried an agent name because one ACP
@@ -55,6 +55,7 @@ from typing import Any
 
 from novaos_client_sdk._a2a import A2ATransport
 from novaos_client_sdk._http import httpx
+from novaos_client_sdk._http_error import status_error_retry_after
 from novaos_client_sdk._transport import ClientTransport
 from novaos_client_sdk.a2a_agent_card import (
     PROTOCOL_BINDING_GRPC,
@@ -611,7 +612,7 @@ class Client:
         )
 
         # Extension data goes in the request metadata map under each extension's
-        # own URI — A2A's data plane for extensions (ADR F7/G1) — and is written
+        # own URI — A2A's data plane for extensions — and is written
         # *after* the caller's metadata, so a caller cannot accidentally shadow
         # an activated extension's payload with a key of the same name.  The URI
         # namespace belongs to the extension; a caller with something to say to
@@ -839,16 +840,9 @@ class Client:
             if status_code == 404:
                 return NovaOSAgentNotFoundError(f"Agent not found: {error_str}", details=details)
             if status_code == 429:
-                retry_after: float | None = None
-                retry_header = error.response.headers.get("Retry-After")
-                if retry_header is not None:
-                    try:
-                        retry_after = float(retry_header)
-                    except ValueError:
-                        pass
                 return NovaOSRateLimitError(
                     f"Rate limit exceeded: {error_str}",
-                    retry_after=retry_after,
+                    retry_after=status_error_retry_after(error),
                     details=details,
                 )
             if status_code in (500, 502, 503, 504):
@@ -1567,7 +1561,7 @@ class Client:
 
         **This operation has no ACP counterpart at all** — ACP offered no way to
         ask an agent what it was working on — and it was missing from the
-        migration's own client-method list until ADR finding F13 caught it.
+        migration's own client-method list until it was caught in review.
 
         Every filter is optional, and every one is a *request*: the spec lets an
         agent implement as much or as little of the filtering as it can, so a

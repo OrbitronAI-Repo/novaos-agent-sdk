@@ -9,7 +9,7 @@ Both roles ship in the same package, `novaos-agent-sdk`, imported as `novaos_cli
 
 ## Two version lines
 
-`2.x` (this line) is the **Agent2Agent (A2A)** SDK: it speaks A2A JSON-RPC 2.0 end to end. It is a breaking change from `1.x` — the ACP-era surface is gone outright, not deprecated, so there is no dual-protocol serving to migrate off of gradually. `1.x` is the **final ACP line**: stable, security and critical fixes only. There is no hosted `1.x` docs site yet; to read its docs, install `novaos-agent-sdk<2` and read the README that ships with it. Migrating an existing `1.x` agent onto this line? Start with [Migrating from 1.x](guides/migrating-from-1x.md).
+`2.x` (this line) is the **Agent2Agent (A2A)** SDK: it speaks A2A JSON-RPC 2.0 end to end. It is a breaking change from `1.x` — the `1.x` handler surface is gone outright, not deprecated, so there is no dual-protocol serving to migrate off of gradually. `1.x` is the **last line on the pre-A2A protocol**: stable, security and critical fixes only. There is no hosted `1.x` docs site yet; to read its docs, install `novaos-agent-sdk<2` and read the README that ships with it. Migrating an existing `1.x` agent onto this line? Start with [Migrating from 1.x](guides/migrating-from-1x.md).
 
 ## Where to go next
 

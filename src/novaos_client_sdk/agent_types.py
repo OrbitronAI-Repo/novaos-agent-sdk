@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .a2a_task import TaskState
+from .check_config import InRunCheckConfig
 
 #: ``SkillResult.status`` -> A2A ``TaskState``. Shared between
 #: :class:`~novaos_client_sdk.agent_builder.AgentBuilder` (which uses this
@@ -59,8 +60,8 @@ class SkillResult:
     ``AUTH_REQUIRED``   ``TASK_STATE_AUTH_REQUIRED``
     ==================  ==============================
 
-    ``WAITING_USER`` mapping onto a first-class protocol state is the point of
-    ADR F4: under ACP the pause was a custom ``awaiting_approval`` field that
+    ``WAITING_USER`` mapping onto a first-class protocol state is the point:
+    under ACP the pause was a custom ``awaiting_approval`` field that
     only NovaOS understood.
 
     **Legacy status spellings are also accepted, deliberately.**
@@ -239,7 +240,7 @@ class AgentRuntimeContext:
     ``SendMessage`` request, and is used exclusively by ``AgentBuilder`` /
     ``AgentExecutionContext``.
 
-    **Why NovaOS ids and A2A ids both appear here** (ADR F13).  Before the A2A
+    **Why NovaOS ids and A2A ids both appear here.**  Before the A2A
     migration this class documented itself as holding "ACP protocol fields", and the
     obvious move on migrating was to rename ``run_id`` to ``task_id`` and
     ``session_id`` to ``context_id``.  That would have been wrong.  A NovaOS *run* is
@@ -256,7 +257,7 @@ class AgentRuntimeContext:
                                         ``run_id`` when the caller supplied none, so the
                                         two match for platform-originated runs.
     ``session_id``    ``context_id``    A2A's ``contextId`` groups related tasks; ACP's
-                                        ``session_id`` meant the same thing (ADR F2).
+                                        ``session_id`` meant the same thing.
     ================  ================  ==================================================
     """
 
@@ -362,6 +363,14 @@ class AgentRuntimeContext:
     #: other caller: an agent-to-agent call, a hand-written request, or a
     #: platform build before this field existed.
     memory_budget: dict[str, int] | None = None
+
+    #: The in-run check the platform resolved for this run: judge model, rubric
+    #: texts with ids and versions, and the bar for each.
+    #:
+    #: Read only from the platform's ``novaos.platform/context``; no environment
+    #: variable or skill argument can supply or change it. ``None`` for every
+    #: other caller, and for a platform build that attached none.
+    in_run_check: InRunCheckConfig | None = None
 
 
 @dataclass

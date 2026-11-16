@@ -594,7 +594,7 @@ def select_interface(
     precedence, minus its protocol-*version*-priority tiebreaking (picking
     among several interfaces that already share one binding but differ in
     ``protocol_version``) — not needed here, since no NovaOS surface or
-    calling convention this ticket covers publishes more than one version per
+    calling convention the SDK covers publishes more than one version per
     binding; :meth:`AgentInterface.protocol_version` handling is otherwise
     unchanged.
 

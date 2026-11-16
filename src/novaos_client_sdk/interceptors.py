@@ -89,8 +89,8 @@ class BeforeArgs:
     """The request's ``params`` object, already built by the ``Client``
     method — read-only in practice: mutating it here would change what the
     agent sees without the interceptor's own record (``after``) reflecting
-    that, so an interceptor that needs to change the request is a bigger
-    change than this ticket, not a use of this field."""
+    that, so an interceptor that needs to change the request needs a
+    different mechanism, not this field."""
 
     http_kwargs: dict[str, Any]
     """Extra keyword arguments to merge into the transport call. Mutate this in

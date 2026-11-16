@@ -19,8 +19,8 @@ agreeing.
 (§5.3) names the operations ``SendMessage``, ``GetTask``, ``CancelTask`` and so
 on.  A2A **v0.3** used slash-separated names (``message/send``, ``tasks/get``);
 those are not v1.0 names, and a v1.0 peer answers ``-32601 Method not found``
-for them.  This matters because the ADR's own F2 concept-mapping table quotes
-the v0.3 spelling — see the note in that ticket's PR.
+for them.  This matters because an earlier concept-mapping table quoted
+the v0.3 spelling.
 
 **Error codes here are the JSON-RPC *transport* errors only** (``-32700`` …
 ``-32603``).  They mean "this was not a well-formed call", and are deliberately
@@ -101,7 +101,7 @@ METHOD_SUBSCRIBE_TO_TASK: Final = "SubscribeToTask"
 # Push notification config methods.  The server half of all
 # four landed earlier; this is what the client side calls.  Note
 # `ListTaskPushNotificationConfigs` is **plural** — v0.3 named it singular,
-# and F20 caught that the ADR's own description still carried that spelling.
+# and an earlier description of it still carried that spelling.
 METHOD_CREATE_TASK_PUSH_NOTIFICATION_CONFIG: Final = "CreateTaskPushNotificationConfig"
 METHOD_GET_TASK_PUSH_NOTIFICATION_CONFIG: Final = "GetTaskPushNotificationConfig"
 METHOD_LIST_TASK_PUSH_NOTIFICATION_CONFIGS: Final = "ListTaskPushNotificationConfigs"
@@ -114,7 +114,7 @@ METHOD_DELETE_TASK_PUSH_NOTIFICATION_CONFIG: Final = "DeleteTaskPushNotification
 # proto3 JSON renders a oneof as whichever member is set.  So the JSON-RPC
 # `result` is `{"task": {...}}` or `{"message": {...}}`, never the object
 # itself.  Returning the Task bare is A2A **v0.3**'s shape — the same class of
-# drift as ADR finding F18, and a strict v1.0 peer rejects it.
+# drift, and a strict v1.0 peer rejects it.
 SEND_MESSAGE_RESULT_TASK: Final = "task"
 SEND_MESSAGE_RESULT_MESSAGE: Final = "message"
 

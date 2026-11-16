@@ -102,6 +102,8 @@ These are part of the core package — no extra install required — but each ta
 
 ::: novaos_client_sdk.logging
 
+::: novaos_client_sdk.run_context
+
 ::: novaos_client_sdk.pii
 
 ::: novaos_client_sdk.utils
@@ -137,6 +139,30 @@ These modules need an additional extra installed (`pip install "novaos-agent-sdk
 Tracing helpers (`get_traceparent`, `inject_trace_headers`, `traced_tool_call`, `configure_otel`, ...) work without this extra as no-ops; install it to actually export spans to an OpenTelemetry collector.
 
 ::: novaos_client_sdk.tracing
+
+### `agent-loop` — the agent loop runner
+
+The limits, the stall guard, the key builder and the result types import without this extra; `AgentLoop` needs it. See the [Agent loop guide](../guides/agent-loop.md).
+
+::: novaos_client_sdk.agent_loop.limits
+
+::: novaos_client_sdk.agent_loop.ports
+
+::: novaos_client_sdk.agent_loop.guards
+
+::: novaos_client_sdk.agent_loop.result
+
+::: novaos_client_sdk.agent_loop.context
+
+::: novaos_client_sdk.agent_loop.context.layer
+
+::: novaos_client_sdk.agent_loop.context.memory
+
+::: novaos_client_sdk.agent_loop.context.evidence
+
+::: novaos_client_sdk.agent_loop.context.summary
+
+::: novaos_client_sdk.agent_loop.runner
 
 ### `evaluation` — offline/CI agent evaluation
 

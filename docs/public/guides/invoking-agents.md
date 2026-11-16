@@ -44,7 +44,7 @@ Each frame is one of A2A's `StreamResponse` members: a `TaskStatusUpdateEvent`, 
 ## Tasks: fetch, reconnect, list, cancel
 
 ```python
-# One authoritative snapshot — no ACP equivalent; an ACP run couldn't be re-queried.
+# One authoritative snapshot — no 1.x equivalent; a 1.x run couldn't be re-queried.
 task = await client.get_task(task_id)
 
 # Reconnect a dropped stream — the first frame is always the task's current
@@ -54,7 +54,7 @@ async for frame in client.subscribe_to_task(task_id):
     if is_last_frame(frame):
         break
 
-# Enumerate what the agent is working on — also no ACP equivalent.
+# Enumerate what the agent is working on — also no 1.x equivalent.
 page = await client.list_tasks(status="TASK_STATE_WORKING", page_size=20)
 for t in page.tasks:
     print(t.id, t.status.state)
@@ -129,3 +129,25 @@ asyncio.run(main())
 `execute()` starts a run and returns immediately with a `run_id`; `events()` opens a Server-Sent Events subscription for it. Branch on `event.is_terminal` / `event.is_failure` rather than on `event.type == "done"` or `"error"`: the gateway can also end a run by replaying a `status` event carrying a terminal run status — `is_terminal` is the one check that covers every shape an ending arrives in. `instance_id` identifies an *installed* agent instance (not an agent name) — the UUID your application already has from installing the agent on the platform.
 
 Unlike `Client.cancel_task`, `GatewayClient` exposes no generic "cancel this run" call — a running gateway execution is stopped the same way any HTTP/SSE request is, by closing the connection or cancelling the `asyncio` task awaiting it. `gw.streaming_health()` checks whether the real-time SSE subsystem is available before you subscribe, so you can fail over to polling if it isn't.
+
+### Choosing a skill
+
+An agent can offer more than one skill. Pass `skill` to `execute()` to choose which one runs; it is sent only when you set it. An agent with a single skill needs no selector. Calling a multi-skill agent without `skill` is not guessed for you: `execute()` still returns a `run_id`, and the run then ends as failed with an explicit error.
+
+A common pattern is two calls on the same thread: one skill to ingest material, then another to ask questions about it.
+
+```python
+async with GatewayClient(base_url="http://execution-gateway.example.com", auth=auth) as gw:
+    first = await gw.execute(
+        instance_id="<installed-agent-instance-uuid>",
+        input_text="Here is the report to read.",
+        skill="ingest",
+        thread_id="<thread-id>",
+    )
+    second = await gw.execute(
+        instance_id="<installed-agent-instance-uuid>",
+        input_text="What were the main findings?",
+        skill="ask",
+        thread_id="<thread-id>",
+    )
+```

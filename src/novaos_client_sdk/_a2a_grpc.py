@@ -3,7 +3,7 @@
 Behind the optional ``grpc`` extra (``pip install
 novaos-client-sdk[grpc]``).  Unlike JSON-RPC and HTTP+JSON — both plain JSON,
 which is why this SDK owns its own transport for them rather than depending on
-``a2a-sdk`` (see ``_a2a.py``'s module docstring for that ADR) — gRPC's wire
+``a2a-sdk`` (see ``_a2a.py``'s module docstring for that decision) — gRPC's wire
 format literally *is* protobuf, so some compiled ``.proto`` is unavoidable.
 Rather than vendor and independently regenerate the identical schema
 ``a2a-sdk`` already publishes and versions, this module imports its
@@ -11,7 +11,7 @@ pre-generated ``a2a.types.a2a_pb2`` / ``a2a_pb2_grpc`` — the compiled message
 and stub classes only, **never** ``a2a.client.*`` (its ``ClientTransport``,
 ``ClientFactory`` or ``Client``).  This transport's method dispatch, header
 negotiation, SSRF integration and error mapping are all NovaOS's own code,
-exactly as the ADR requires for the other two bindings — only the schema
+exactly as that decision requires for the other two bindings — only the schema
 artifact itself is borrowed, because there is no alternative source for it
 that isn't this SDK re-deriving and re-maintaining the same ``.proto`` a2a-sdk
 already tracks against the spec.

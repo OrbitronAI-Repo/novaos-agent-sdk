@@ -14,8 +14,8 @@ Transport Binding"), rendered through ``google.api.http`` annotations. Rather
 than re-deriving them from the spec's binary options, the verb/path table
 below was confirmed against the reference ``a2a-sdk``'s own
 ``a2a/client/transports/rest.py``, itself conformance-tested against a real
-server in ``tests/test_a2a_v1_conformance.py`` — which this ticket extends
-with a REST peer.
+server in ``tests/test_a2a_v1_conformance.py`` — which also
+covers a REST peer.
 
 **Path-variable field names came from this SDK's own params, not a guess.**
 The task/config id keys a path pulls out of ``params`` (``"id"``, ``"taskId"``)

@@ -19,7 +19,7 @@ what every one of the four wire methods actually addresses a config by
 and ``delete_task_push_notification_config`` both take ``task_id`` *and*
 ``config_id``).
 
-**Scope, same as the task store (ADR F9/F15).** An in-process store is the
+**Scope, same as the task store.** An in-process store is the
 right default for the same reason ``InMemoryTaskStore`` is: a pod is not
 internet-reachable, and there is no gateway-owned durable record for push
 notification config the way there is for run status — so there is nothing for
@@ -100,7 +100,7 @@ class PushNotificationConfigStore(ABC):
 class InMemoryPushNotificationConfigStore(PushNotificationConfigStore):
     """A :class:`PushNotificationConfigStore` backed by a dict in this process's memory.
 
-    The default (and, per ADR F9/F15, the only) store this SDK ships — see the
+    The default (and the only) store this SDK ships — see the
     module docstring.
 
     **Eviction policy.** Identical to

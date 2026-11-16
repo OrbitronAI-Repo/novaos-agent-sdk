@@ -83,7 +83,7 @@ def _text_part(content: str, content_type: str = _DEFAULT_MEDIA_TYPE) -> TextPar
     A2A v1.0 gives every part a real ``mediaType`` field, so a caller asking for
     e.g. "text/markdown" gets it in the protocol's own slot.  (Against v0.3 this
     went into a NovaOS metadata key, because that revision's text part had no
-    content-type field — see F18.)  Plain "text/plain" is left unset: it is
+    content-type field.)  Plain "text/plain" is left unset: it is
     A2A's default and needs no annotation.
     """
     if content_type and content_type != _DEFAULT_MEDIA_TYPE:
@@ -115,7 +115,7 @@ def _a2a_message_with_metadata(
 ) -> A2AMessage:
     """Build an A2A Message with a visible text part and an invisible metadata part.
 
-    ``session_id`` maps to A2A's ``contextId`` (ADR F2), so a multi-turn NovaOS
+    ``session_id`` maps to A2A's ``contextId``, so a multi-turn NovaOS
     session is expressed in the protocol's own vocabulary rather than only
     inside the NovaOS metadata payload.
     """

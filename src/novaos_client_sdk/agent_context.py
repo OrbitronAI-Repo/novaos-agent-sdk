@@ -48,6 +48,7 @@ from .a2a_task import Task
 from .a2a_task_updater import TaskUpdater
 from .a2a_types import A2AMessage, as_dict, as_str
 from .agent_types import AgentRuntimeContext, ConversationTurn
+from .check_config import InRunCheckConfig, resolve_in_run_check
 from .exceptions import SecretNotDeliveredError
 from .header_safety import filter_custom_headers
 from .logging import get_agent_logger
@@ -69,7 +70,7 @@ _AUTH_PROXY_TOKEN_HEADER = "x-novaos-execution-token"
 # ⚠️ This is a plain namespaced metadata key, **not** a declared A2A extension,
 #    and nothing sensitive belongs in it.  That is a standing rule rather than a
 #    stopgap: extension data and this key are the same plain JSON in the same
-#    request body, visible to the same proxies and APM tooling (ADR F7/G1), so
+#    request body, visible to the same proxies and APM tooling, so
 #    the confidentiality does not come from the placement — it comes from the
 #    value being sealed first.  Secrets therefore travel through the
 #    ``user-context/v1`` extension (:mod:`novaos_client_sdk.a2a_user_context`),
@@ -81,6 +82,11 @@ NOVAOS_CONTEXT_METADATA_KEY = "novaos.platform/context"
 #: :meth:`AgentExecutionContext.get_secret` can both raise on an undeclared
 #: secret and return ``None`` for one a caller is happy to do without.
 _NO_SECRET_DEFAULT: Any = object()
+
+#: Comma-separated names of the secrets the platform injected as environment
+#: variables. Optional: it lets ``secret_names`` enumerate them; ``get_secret``
+#: reads the environment by name whether or not it is set.
+_SECRET_NAMES_ENV = "NOVAOS_SECRET_NAMES"
 
 
 def _user_context_extension_uri() -> str | None:
@@ -383,10 +389,11 @@ class AgentExecutionContext:
         )
         # Propagate the per-request W3C traceparent to all tool bindings so outbound
         # MCP calls carry the correct trace context in fleet mode where TRACEPARENT
-        # env var is set at pod startup and becomes stale (P4-fleet F16).
+        # env var is set at pod startup and becomes stale.
         if execution_context.traceparent:
             self.tools.set_traceparent(execution_context.traceparent)
         self.tools.set_run_id(execution_context.run_id)
+        self.tools.set_idempotency_key(execution_context.idempotency_key)
         self.tools.set_custom_headers(self._custom_headers)
         # `emit_tool_event` is only ever non-None for a streaming request —
         # see the parameter's docstring above.
@@ -587,7 +594,13 @@ class AgentExecutionContext:
 
     @property
     def secret_names(self) -> tuple[str, ...]:
-        """Every secret name this request delivered, sorted; empty when none were.
+        """Every secret name available to this request, sorted; empty when none are.
+
+        Names delivered sealed with the request, plus any name listed in the
+        ``NOVAOS_SECRET_NAMES`` environment variable (comma-separated) that is
+        actually set in the environment — see :meth:`get_secret` for the
+        environment path. A secret that is only in the environment and not
+        listed there still works with :meth:`get_secret` but is not enumerated.
 
         Safe to log — names travel in the clear on the wire by design, since a
         pod must be able to route a value before it can decrypt one. Worth
@@ -595,10 +608,19 @@ class AgentExecutionContext:
         instance declares no such secret" from "delivery is not working".
         """
         sealed = self._sealed_user_context()
-        return () if sealed is None else sealed.secret_names
+        sealed_names = () if sealed is None else tuple(sealed.secret_names)
+        listed = (n.strip() for n in os.environ.get(_SECRET_NAMES_ENV, "").split(","))
+        return tuple(sorted({*sealed_names, *(n for n in listed if n and n in os.environ)}))
 
     def get_secret(self, name: str, default: Any = _NO_SECRET_DEFAULT) -> Any:
-        """The value of one secret delivered with this request.
+        """The value of one secret available to this request.
+
+        Secrets reach an agent two ways, and this reads both. A secret sealed to
+        this pod and delivered with the request (below) is used first. When none
+        arrived under ``name`` — or no sealed delivery happened at all — the
+        environment variable named exactly ``name`` is used, which is how the
+        platform injects the secrets installed with an instance on some
+        deployments. A failed sealed open never falls back to the environment.
 
         The A2A-era replacement for ACP's ``context.secrets``. The worker seals
         each value to this pod's recipient key before placing it in the request
@@ -645,6 +667,8 @@ class AgentExecutionContext:
         """
         sealed = self._sealed_user_context()
         if sealed is None:
+            if name in os.environ:
+                return os.environ[name]
             if default is not _NO_SECRET_DEFAULT:
                 return default
             uri = _user_context_extension_uri()
@@ -654,7 +678,8 @@ class AgentExecutionContext:
                 else "the SDK's 'crypto' extra is not installed, so sealed delivery is unavailable"
             )
             raise SecretNotDeliveredError(
-                f"no secret named '{name}' is available: {why}",
+                f"no secret named '{name}' is available: {why}, and no environment variable "
+                f"'{name}' is set",
                 details={"secret_name": name, "delivered": [], "extension": uri},
             )
 
@@ -668,6 +693,8 @@ class AgentExecutionContext:
                 run_id=self._ctx.run_id,
             )
         except SecretNotDeliveredError:
+            if name in os.environ:
+                return os.environ[name]
             if default is not _NO_SECRET_DEFAULT:
                 return default
             raise
@@ -766,7 +793,7 @@ class AgentExecutionContext:
     def context_id(self) -> str:
         """A2A ``contextId`` grouping this task with related ones.
 
-        A2A's name for what ACP called ``session_id`` (ADR F2); :attr:`session_id`
+        A2A's name for what ACP called ``session_id``; :attr:`session_id`
         returns the same value for callers that still use the older name.
         """
         return self._ctx.context_id
@@ -844,6 +871,16 @@ class AgentExecutionContext:
         return self._ctx.memory_budget
 
     @property
+    def in_run_check(self) -> InRunCheckConfig | None:
+        """The in-run check the platform resolved for this run, or ``None``.
+
+        Judge model, rubric texts with their ids and versions, and the bar for
+        each. It comes only from the platform's context: no environment
+        variable and no skill argument supplies or changes it.
+        """
+        return self._ctx.in_run_check
+
+    @property
     def memory(self) -> "MemoryNamespace":
         """Pre-fetched memory context, and a factory for on-demand ``MemoryClient`` calls.
 
@@ -914,6 +951,8 @@ class AgentExecutionContext:
                 run_id=self._ctx.run_id,
                 agent_id=self._ctx.instance_id,
                 tenant_id=self._ctx.tenant_id,
+                trace_id=self._ctx.trace_id,
+                instance_id=self._ctx.instance_id,
                 # Use a unique name per run so multiple concurrent executions
                 # in the same process each get their own context-bound logger.
                 name=f"novaos.agent.{self._ctx.run_id or 'default'}",
@@ -1076,6 +1115,7 @@ class AgentExecutionContext:
                 history=_conversation_history(novaos_context),
                 mcp_write_hitl_active=_resolve_mcp_write_hitl_active(novaos_context),
                 memory_budget=_resolve_memory_budget(novaos_context),
+                in_run_check=resolve_in_run_check(novaos_context),
             ),
             extensions=extensions,
             verified_tenant_id=headers.get("x-novaos-tenant-id", ""),

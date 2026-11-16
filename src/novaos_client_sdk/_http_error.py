@@ -88,6 +88,19 @@ def status_error_message(service: str, exc: httpx.HTTPStatusError, *, context: s
         return f"{service} returned HTTP error{context}: {exc}"
 
 
+def status_error_retry_after(exc: httpx.HTTPStatusError) -> float | None:
+    """Read the response's ``Retry-After`` delay in seconds, or ``None``.
+
+    Only the delta-seconds form is understood: an HTTP-date value yields ``None``
+    rather than a guess, and a missing or malformed header is ignored.
+    """
+    try:
+        header = exc.response.headers.get("Retry-After")
+        return None if header is None else float(header)
+    except Exception:  # noqa: BLE001 - must never raise
+        return None
+
+
 def status_error_details(exc: httpx.HTTPStatusError) -> dict[str, Any]:
     """``details`` dict for the raised error, including ``response_body`` if any."""
     details: dict[str, Any] = {"original_error": type(exc).__name__}

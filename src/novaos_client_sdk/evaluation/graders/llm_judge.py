@@ -19,8 +19,11 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+import httpx
 
 if TYPE_CHECKING:
     from novaos_client_sdk.context import ExecutionContext
@@ -30,6 +33,10 @@ logger = logging.getLogger("novaos.evaluation.llm_judge")
 DEFAULT_JUDGE_MODEL = "gpt-4o-mini"
 LLM_GATEWAY_URL_ENV = "LLM_GATEWAY_URL"
 DEFAULT_GATEWAY_URL = "http://localhost:4000"
+GATEWAY_DEFAULTS_PATH = "/gateway/defaults"
+GATEWAY_JUDGE_DEFAULT_NAMESPACE = "llm_judge"
+GATEWAY_JUDGE_DEFAULT_KEY = "default_model"
+GATEWAY_DEFAULTS_TIMEOUT_SECONDS = 3.0
 
 SCORE_PARSE_PATTERN = re.compile(r'"?score"?\s*[:=]\s*([01](?:\.\d+)?)')
 
@@ -163,6 +170,58 @@ def parse_judge_score(raw_text: str) -> tuple[float | None, str]:
     return None, text
 
 
+_DEFAULT_CACHE_TTL_SECONDS = 60.0
+_DEFAULT_CACHE_MAX_ENTRIES = 16
+# gateway base URL -> (fetched at, default model or None). A failed lookup is cached too, so a
+# slow or down gateway costs one 3 s wait per TTL, not one per judge call.
+_default_cache: dict[str, tuple[float, str | None]] = {}
+
+
+def clear_gateway_default_cache() -> None:
+    """Forget the cached default judge model. For tests."""
+    _default_cache.clear()
+
+
+async def fetch_gateway_judge_default(
+    gateway_url: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> str | None:
+    """Return the default judge model the LLM Gateway serves, or None.
+
+    Reads ``GET /gateway/defaults``, which needs no token, and takes ``llm_judge`` /
+    ``default_model`` from the response (``{"defaults": {namespace: {key: value}}}``, the platform
+    defaults). Any failure (gateway down, no such route on an older gateway, no
+    default set) returns None so the caller falls back to its own default. The result, failure
+    included, is cached per gateway URL for 60 seconds.
+    """
+    base = (gateway_url or os.environ.get(LLM_GATEWAY_URL_ENV, DEFAULT_GATEWAY_URL)).rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    now = time.monotonic()
+    cached = _default_cache.get(base)
+    if cached is not None and now - cached[0] < _DEFAULT_CACHE_TTL_SECONDS:
+        return cached[1]
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=GATEWAY_DEFAULTS_TIMEOUT_SECONDS)
+    model: str | None = None
+    try:
+        response = await http.get(base + GATEWAY_DEFAULTS_PATH)
+        response.raise_for_status()
+        value = response.json()["defaults"][GATEWAY_JUDGE_DEFAULT_NAMESPACE][
+            GATEWAY_JUDGE_DEFAULT_KEY
+        ]
+        model = value.strip() if isinstance(value, str) and value.strip() else None
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        logger.debug("No default judge model from %s", base, exc_info=True)
+    finally:
+        if own_client:
+            await http.aclose()
+    if len(_default_cache) >= _DEFAULT_CACHE_MAX_ENTRIES:
+        _default_cache.pop(next(iter(_default_cache)))  # the oldest entry
+    _default_cache[base] = (now, model)
+    return model
+
+
 async def call_llm_judge(
     messages: list[dict[str, str]],
     model: str | None = None,
@@ -172,13 +231,20 @@ async def call_llm_judge(
     temperature: float = 0.0,
     max_tokens: int = 256,
 ) -> str:
-    """Make an async LLM call through the Gateway for judge scoring.
+    """Make an async LLM call through the Gateway for judge scoring (offline evaluation).
+
+    The model is the ``model`` argument, else ``NOVAOS_JUDGE_MODEL``, else the default
+    judge model the Gateway serves (:func:`fetch_gateway_judge_default`), else
+    ``gpt-4o-mini``. That suits local and offline evaluation. The agent loop uses
+    :func:`call_pinned_judge` instead, which never reads the environment.
 
     Routes through :class:`~novaos_client_sdk.llm.LLMClient` so future
     hardening (retry, mTLS, header propagation) applies automatically.
 
     The call is tagged with ``novaos_eval_judge: true`` in the request
-    metadata so the Gateway can apply PII policy (no message logging).
+    metadata so the Gateway can recognise a judge call.  The Gateway turns
+    message logging off for every request itself and refuses the flag when a
+    client sends it.
 
     Auth is *required*.  Resolution order:
 
@@ -194,8 +260,8 @@ async def call_llm_judge(
 
     Args:
         messages: Chat messages in OpenAI format.
-        model: Override model name (default: ``NOVAOS_JUDGE_MODEL`` env or
-            ``gpt-4o-mini``).
+        model: Override model name (default: ``NOVAOS_JUDGE_MODEL`` env, then the
+            Gateway's default judge model, then ``gpt-4o-mini``).
         gateway_url: Override LLM Gateway URL (default: ``LLM_GATEWAY_URL``
             env or ``http://localhost:4000``).
         execution_context: :class:`~novaos_client_sdk.context.ExecutionContext`
@@ -214,14 +280,92 @@ async def call_llm_judge(
         openai.APIStatusError: Non-2xx response from the Gateway.
         ValueError: The Gateway returned no choices.
     """
-    # Deferred imports — avoid hard dependencies at module load time.
+    resolved_model = model or os.environ.get("NOVAOS_JUDGE_MODEL")
+    if not resolved_model:
+        resolved_model = await fetch_gateway_judge_default(gateway_url) or DEFAULT_JUDGE_MODEL
+    return await _call_judge_gateway(
+        messages,
+        model=resolved_model,
+        gateway_url=gateway_url,
+        execution_context=execution_context,
+        execution_token=execution_token,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+@dataclass(frozen=True)
+class PinnedJudgeReply:
+    """A judge reply and the model version the gateway says served it (``None`` if it did not)."""
+
+    content: str
+    model_version: str | None = None
+
+
+async def call_pinned_judge_reply(
+    messages: list[dict[str, str]],
+    *,
+    model: str,
+    gateway_url: str | None = None,
+    execution_context: ExecutionContext | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 256,
+) -> PinnedJudgeReply:
+    """:func:`call_pinned_judge`, returning the served model version with the text."""
+    if not model or not model.strip():
+        raise ValueError("call_pinned_judge requires a model; it does not fall back to a default")
+    return await _request_judge(
+        messages,
+        model=model,
+        gateway_url=gateway_url,
+        execution_context=execution_context,
+        execution_token=None,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+async def call_pinned_judge(
+    messages: list[dict[str, str]],
+    *,
+    model: str,
+    gateway_url: str | None = None,
+    execution_context: ExecutionContext | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 256,
+) -> str:
+    """Make a judge call to a model chosen by the caller, never by the environment.
+
+    This is the judge path for the agent loop, where the rubric pins the model.
+    Unlike :func:`call_llm_judge` it does not read ``NOVAOS_JUDGE_MODEL`` and has
+    no default model, so a pod cannot switch the judge by setting a variable.
+    ``NOVAOS_JUDGE_MODEL`` stays an offline-evaluation setting.
+
+    The call carries the same ``novaos_eval_judge`` tag as every judge call. The
+    tag is set by this client, so it helps the Gateway catch a misconfigured
+    call; it does not stop a caller that leaves it out.
+
+    Raises:
+        ValueError: ``model`` is empty, raised before any network call.
+        MissingExecutionTokenError: No execution token was available.
+    """
+    reply = await call_pinned_judge_reply(
+        messages,
+        model=model,
+        gateway_url=gateway_url,
+        execution_context=execution_context,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return reply.content
+
+
+def _resolve_judge_context(
+    execution_context: ExecutionContext | None, execution_token: str | None
+) -> ExecutionContext:
+    """The context a judge call authenticates with; raises before any network call."""
     from novaos_client_sdk.context import ExecutionContext as _ExecutionContext
-    from novaos_client_sdk.llm import LLMClient
 
-    resolved_model = model or os.environ.get("NOVAOS_JUDGE_MODEL", DEFAULT_JUDGE_MODEL)
-    resolved_url = gateway_url or os.environ.get(LLM_GATEWAY_URL_ENV, DEFAULT_GATEWAY_URL)
-
-    # Build the resolved ExecutionContext with auth validation.
     # Resolution order: context with token → execution_token string → env var.
     # If execution_context is provided but has no token, fall through to the
     # execution_token kwarg so callers that pass both don't get a spurious error.
@@ -235,17 +379,58 @@ async def call_llm_judge(
 
     # Validate early — raises MissingExecutionTokenError before any network call.
     resolved_ctx.require_token()
+    return resolved_ctx
+
+
+async def _call_judge_gateway(
+    messages: list[dict[str, str]],
+    *,
+    model: str,
+    gateway_url: str | None,
+    execution_context: ExecutionContext | None,
+    execution_token: str | None,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    """Send one tagged judge request through the LLM Gateway."""
+    return (
+        await _request_judge(
+            messages,
+            model=model,
+            gateway_url=gateway_url,
+            execution_context=execution_context,
+            execution_token=execution_token,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    ).content
+
+
+async def _request_judge(
+    messages: list[dict[str, str]],
+    *,
+    model: str,
+    gateway_url: str | None,
+    execution_context: ExecutionContext | None,
+    execution_token: str | None,
+    temperature: float,
+    max_tokens: int,
+) -> PinnedJudgeReply:
+    # Deferred import — avoid a hard dependency at module load time.
+    from novaos_client_sdk.llm import LLMClient
+
+    resolved_url = gateway_url or os.environ.get(LLM_GATEWAY_URL_ENV, DEFAULT_GATEWAY_URL)
+    resolved_ctx = _resolve_judge_context(execution_context, execution_token)
 
     async with LLMClient(base_url=resolved_url, execution_context=resolved_ctx) as llm:
         response = await llm.chat.completions.create(
-            model=resolved_model,
+            model=model,
             messages=messages,  # type: ignore[arg-type]
             temperature=temperature,
             max_tokens=max_tokens,
             extra_body={
                 "metadata": {
                     "novaos_eval_judge": True,
-                    "turn_off_message_logging": True,
                 },
             },
         )
@@ -254,4 +439,4 @@ async def call_llm_judge(
     if not choices:
         raise ValueError("Judge LLM returned no choices")
 
-    return choices[0].message.content or ""
+    return PinnedJudgeReply(choices[0].message.content or "", getattr(response, "model", None))

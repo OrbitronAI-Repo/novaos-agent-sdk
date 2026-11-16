@@ -106,8 +106,8 @@ class MessageValidator:
         applies to messages that present as A2A; anything else passes here,
         leaving format-agnostic validation to :meth:`validate_message`.
 
-        (v0.3 also required ``kind == "message"``.  v1.0 dropped that field —
-        see F18 — so the A2A-shape test is structural now, not a discriminator
+        (v0.3 also required ``kind == "message"``.  v1.0 dropped that field,
+        so the A2A-shape test is structural now, not a discriminator
         lookup.)
 
         Args:

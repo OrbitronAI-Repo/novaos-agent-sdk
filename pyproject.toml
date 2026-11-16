@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "novaos-agent-sdk"
-version = "2.1.0"
+version = "2.3.0"
 description = "Python client library for connecting to and communicating with AI Agents that implement the Agent2Agent Protocol (A2A), spec v1.0.1"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -72,9 +72,18 @@ classifiers = [
 #    `src/novaos_client_sdk/_a2a_grpc.py`'s module docstring.
 dependencies = [
     "httpx>=0.24.0",
+    # Imported directly by `_ssrf` for its connection guard; httpx already requires it.
+    "httpcore>=0.17.3",
     # Imported directly by `dns.validate_agent_url` to encode hostnames the
     # same way httpx does; httpx already requires it.
     "idna>=3.0",
+    # Tracing is part of the default install: without these an agent exports
+    # no spans, which looked like a platform fault rather than a missing extra.
+    # Only the OTLP/HTTP exporter ships; the `otel` extra below is kept as an
+    # empty alias so `pip install novaos-agent-sdk[otel]` keeps working.
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
 ]
 
 [project.optional-dependencies]
@@ -100,12 +109,12 @@ llm = [
 evaluation = [
     "langfuse>=2.0.0,<3",
     "openai>=1.0.0",
+    # Rubric files: YAML front matter checked against a JSON Schema.
+    "jsonschema>=4.18.0",
+    "pyyaml>=6.0",
 ]
-otel = [
-    "opentelemetry-api>=1.20.0",
-    "opentelemetry-sdk>=1.20.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
-]
+# Empty alias: the OpenTelemetry packages are now core dependencies (see above).
+otel = []
 schema = [
     "jsonschema>=4.18.0",
 ]
@@ -122,13 +131,24 @@ migrate = [
     # the pin, matching the `grpc`/`otel` precedent.
     "libcst>=1.4.0,<2",
 ]
+agent-loop = [
+    # `NovaCheckpointSaver` (`novaos_client_sdk.checkpoint.langgraph_saver`) subclasses
+    # LangGraph's `BaseCheckpointSaver`. The save/resume interface itself
+    # (`novaos_client_sdk.checkpoint`) needs none of this and imports without it.
+    "langgraph>=1.0,<2",
+    "langgraph-checkpoint>=3.0,<4",
+]
+baml = [
+    # `novaos_client_sdk.baml_helpers` imports `baml_py.ClientRegistry` lazily at call time.
+    "baml-py>=0.200,<1",
+]
 grpc = [
     # Bare `a2a-sdk`, not `a2a-sdk[grpc]`: the compiled `a2a.types.a2a_pb2` /
     # `a2a_pb2_grpc` modules this extra actually needs are always importable
     # once `a2a-sdk` (and its core `protobuf` dependency) is installed — they
     # are not gated behind its own `[grpc]` sub-extra, which additionally
     # pulls in `grpcio-tools`/`grpcio-reflection`. Those are codegen/reflection
-    # tooling this SDK has no use for as a client; see the ADR paragraph above
+    # tooling this SDK has no use for as a client; see the A2A dependency decision above
     # `dependencies` for why this extra takes only the compiled schema and
     # nothing else from `a2a-sdk`.
     "a2a-sdk>=1.1,<2",
@@ -141,14 +161,14 @@ all = [
     "rfc8785>=0.1.4,<1",
     "openai>=1.0.0",
     "langfuse>=2.0.0,<3",
-    "opentelemetry-api>=1.20.0",
-    "opentelemetry-sdk>=1.20.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
     "jsonschema>=4.18.0",
     "libcst>=1.4.0,<2",
+    "langgraph>=1.0,<2",
+    "langgraph-checkpoint>=3.0,<4",
     "a2a-sdk>=1.1,<2",
     "grpcio>=1.60",
     "grpcio-status>=1.60",
+    "baml-py>=0.200,<1",
 ]
 
 [dependency-groups]
@@ -235,6 +255,10 @@ dev = [
     # referencing the `migrate` extra rather than restating its pin, matching
     # the `grpc`/`otel` lines here so the two cannot drift.
     "novaos-agent-sdk[migrate]",
+    # `GatewayJudge` raises at construction without `openai`, and the in-run check tests build
+    # a real one (faking only the gateway call). Self-referencing the `llm` extra rather than
+    # restating its pin, matching the `grpc`/`migrate` lines, so the two cannot drift.
+    "novaos-agent-sdk[llm]",
     # OpenTelemetry, needed by the *tests* rather than by the SDK's runtime —
     # `tracing.py` and `agent_builder.py` both import it behind an `_HAS_OTEL`
     # guard, and `tests/test_knowledge_tool_resilience.py` imports `StatusCode`
@@ -249,6 +273,9 @@ dev = [
     # exercising the otel branch in CI. Self-referencing the `otel` extra rather
     # than restating its three packages, so the two cannot drift.
     "novaos-agent-sdk[otel]",
+    # `tests/checkpoint` runs the LangGraph saver against LangGraph's own in-memory saver.
+    # Self-referencing the `agent-loop` extra so the pins cannot drift.
+    "novaos-agent-sdk[agent-loop]",
 ]
 
 [project.urls]
@@ -256,6 +283,7 @@ Homepage = "https://github.com/OrbitronAI-Repo/novaos-agent-sdk"
 Documentation = "https://orbitronai-repo.github.io/novaos-agent-sdk/"
 Repository = "https://github.com/OrbitronAI-Repo/novaos-agent-sdk"
 Changelog = "https://orbitronai-repo.github.io/novaos-agent-sdk/changelog/"
+CLI = "https://www.npmjs.com/package/novaos-cli"
 Issues = "https://github.com/OrbitronAI-Repo/novaos-agent-sdk/issues"
 
 [tool.setuptools]
@@ -266,6 +294,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
+# Read by coding assistants that only have the installed package.
+"novaos_client_sdk" = ["AGENT_GUIDE.md", "llms.txt"]
+"novaos_client_sdk.evaluation.rubrics" = ["rubric.schema.json"]
 
 # Ruff configuration
 [tool.ruff]
