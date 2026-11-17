@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-11-17
+
+### Added
+- A new guide, *Steps that need a person*, lists the steps that need someone in a web browser (sign-in, admin approval of a new version, installing from the web UI), who does each and on which marketplace page, and when the approval policy skips the admin step. It also sets out how a coding assistant should behave at those steps: stop and say who must act and where, never claim an agent is live or invent an instance ID, never try to approve its own agent, check for itself once the person says it's done, and offer browser help only with the person's consent for each action. *Installing and running a published agent* links to it.
+- A new guide, *Installing and running a published agent*, lists the six interim calls that install your own copy of a published agent, find it, run it and read its answer: the public Agent Card, `POST /api/instances` on the marketplace (with the `X-Requested-With` header it requires), `GET /api/v1/instances`, `POST /api/v1/execute` with `X-Idempotency-Key`, `GET /api/v1/runs/<run-id>` and its `/events`, where the answer is the `message.final` event. It also shows the same run from `GatewayClient` with an idempotency key, and the CLI commands to use when a run fails. The calls are marked interim until the CLI has its own commands.
+
+### Fixed
+- `AGENT_GUIDE.md` and `llms.txt`, shipped in the package, linked to two guides that were not on the documentation site yet (*Installing and running a published agent* and *Steps that need a person*); both are now published. The guide also said `publish-status --wait` needs `novaos-cli` 2.3.0 or later; it needs 2.2.0 or later.
+
 ## [2.3.0] - 2026-11-16
 
 ### Added
@@ -138,7 +147,8 @@ Version line: `2.0.0` is a breaking change from the `1.x` ACP line (ACP surface 
 - **`AgentExecutionContext.trace_id` now carries the bare W3C trace id, not the whole `traceparent` header.** It previously stored the full header string, so anything correlating on the trace id alone — logs, spans, downstream lookups — never matched. The raw header is available as a new `traceparent` field for propagation, and tool-call spans now also carry `novaos.run_id`. **Behaviour change:** code reading `trace_id` and expecting a `00-<trace>-<span>-01` string should read `traceparent` instead.
 - **`MemoryClient(max_retries=0)` now issues one attempt instead of none.** Previously the retry loop ranged directly over `max_retries`, so `0` skipped the loop body entirely — the only place that calls the memory service — and the method raised a `TypeError` from an unset error variable instead of ever reaching the service or surfacing its real response. `max_retries=0` now means "no retries", matching its documented intent, not "no attempts": the one attempt still runs, and its real error (or result) is what a caller sees on failure.
 
-[Unreleased]: https://github.com/OrbitronAI-Repo/novaos-agent-sdk/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/OrbitronAI-Repo/novaos-agent-sdk/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/OrbitronAI-Repo/novaos-agent-sdk/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/OrbitronAI-Repo/novaos-agent-sdk/compare/v2.1.0...v2.3.0
 [2.1.0]: https://github.com/OrbitronAI-Repo/novaos-agent-sdk/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/OrbitronAI-Repo/novaos-agent-sdk/releases/tag/v2.0.0

@@ -27,7 +27,7 @@ novaos-cli publish manifest.json             # build the image, push it, submit 
 novaos-cli publish-status <review-id> --wait # follow the review; the id is printed by `publish`
 ```
 
-`--wait` needs `novaos-cli` 2.3.0 or later. With an older CLI, run
+`--wait` needs `novaos-cli` 2.2.0 or later. With an older CLI, run
 `novaos-cli publish-status <review-id>` again until it says `ACTIVE`.
 
 Then install your own copy of the agent and run it (section 3).
@@ -35,8 +35,8 @@ Then install your own copy of the agent and run it (section 3).
 - `init` takes the publisher from your signed-in identity; pass `--publisher <slug>` if your
   account has none.
 - `publish` and `publish-status` need the developer role on your account.
-- `publish-status --wait` (CLI 2.3.0 or later) polls until the version is `ACTIVE`, `REJECTED`
-  or `ROLLED_BACK`, and gives up after 900 seconds (`--timeout <seconds>`, also 2.3.0 or later,
+- `publish-status --wait` (CLI 2.2.0 or later) polls until the version is `ACTIVE`, `REJECTED`
+  or `ROLLED_BACK`, and gives up after 900 seconds (`--timeout <seconds>`, also 2.2.0 or later,
   changes that). It exits 0 for `ACTIVE`, and 1 for `REJECTED`, `ROLLED_BACK` or a timeout.
   `--verify` also fetches the served Agent Card once the agent is live.
 

@@ -56,6 +56,8 @@ nav:
   - Guides:
       - Authentication: guides/authentication.md
       - Invoking agents: guides/invoking-agents.md
+      - Installing and running a published agent: guides/installing-and-running.md
+      - Steps that need a person: guides/steps-that-need-a-person.md
       - Building an agent: guides/building-an-agent.md
       - Platform tools: guides/platform-tools.md
       - Agent memory: guides/memory.md

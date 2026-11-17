@@ -126,7 +126,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`execute()` starts a run and returns immediately with a `run_id`; `events()` opens a Server-Sent Events subscription for it. Branch on `event.is_terminal` / `event.is_failure` rather than on `event.type == "done"` or `"error"`: the gateway can also end a run by replaying a `status` event carrying a terminal run status — `is_terminal` is the one check that covers every shape an ending arrives in. `instance_id` identifies an *installed* agent instance (not an agent name) — the UUID your application already has from installing the agent on the platform.
+`execute()` starts a run and returns immediately with a `run_id`; `events()` opens a Server-Sent Events subscription for it. Branch on `event.is_terminal` / `event.is_failure` rather than on `event.type == "done"` or `"error"`: the gateway can also end a run by replaying a `status` event carrying a terminal run status — `is_terminal` is the one check that covers every shape an ending arrives in. `instance_id` identifies an *installed* agent instance (not an agent name) — the UUID your application already has from installing the agent on the platform. [Installing and running a published agent](installing-and-running.md) shows how to install one, find its `instance_id`, get the gateway URL and token, and read the answer.
 
 Unlike `Client.cancel_task`, `GatewayClient` exposes no generic "cancel this run" call — a running gateway execution is stopped the same way any HTTP/SSE request is, by closing the connection or cancelling the `asyncio` task awaiting it. `gw.streaming_health()` checks whether the real-time SSE subsystem is available before you subscribe, so you can fail over to polling if it isn't.
 

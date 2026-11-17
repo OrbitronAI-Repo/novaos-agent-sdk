@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "novaos-agent-sdk"
-version = "2.3.0"
+version = "2.3.1"
 description = "Python client library for connecting to and communicating with AI Agents that implement the Agent2Agent Protocol (A2A), spec v1.0.1"
 readme = "README.md"
 requires-python = ">=3.12"

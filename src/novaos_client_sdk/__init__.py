@@ -352,7 +352,7 @@ from novaos_client_sdk.pii import mask_pii, mask_pii_in_dict
 from novaos_client_sdk.schema_validation import validate_against_schema
 from novaos_client_sdk.utils import match_capabilities, normalize_capability_name
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 __all__ = [
     "__version__",
